@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+            platform: darwin-arm64
+          - goos: darwin
+            goarch: amd64
+            platform: darwin-amd64
+          - goos: linux
+            goarch: amd64
+            platform: linux-amd64
+          - goos: linux
+            goarch: arm64
+            platform: linux-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build sidecar binary
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist/bin dist/bundles
+          go build -trimpath -o dist/bin/tool .
+
+      - name: Install mtools-plugin CLI
+        run: go install github.com/seiortech/mtools-sdk/cmd/mtools-plugin@v0.1.0
+
+      - name: Pack and verify signed bundle
+        env:
+          MTOOLS_PLUGIN_PRIV_KEY: ${{ secrets.MTOOLS_PLUGIN_PRIV_KEY }}
+        run: |
+          if [ -z "${MTOOLS_PLUGIN_PRIV_KEY:-}" ]; then
+            echo "::error::MTOOLS_PLUGIN_PRIV_KEY secret is not set"
+            exit 1
+          fi
+          printf '%s\n' "$MTOOLS_PLUGIN_PRIV_KEY" > /tmp/mtools_key.priv
+          chmod 600 /tmp/mtools_key.priv
+          mtools-plugin pack \
+            -manifest manifest.json \
+            -surfaces surfaces.json \
+            -bin dist/bin/tool \
+            -platform "${{ matrix.platform }}" \
+            -key /tmp/mtools_key.priv \
+            -out "dist/bundles/com.mtools.youtube-${{ matrix.platform }}.zip"
+          mtools-plugin verify \
+            -bundle "dist/bundles/com.mtools.youtube-${{ matrix.platform }}.zip" \
+            -platform "${{ matrix.platform }}"
+
+      - name: Clean up signing key
+        if: always()
+        run: rm -f /tmp/mtools_key.priv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.platform }}
+          path: dist/bundles/*.zip
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bundle-*
+          merge-multiple: true
+          path: dist/bundles
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist/bundles
+          sha256sum *.zip > SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/bundles/*
