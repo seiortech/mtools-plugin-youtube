@@ -1,16 +1,35 @@
-name: Release
+name: Build Plugin
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish a GitHub Release with built bundles and SHA256SUMS.txt"
+        required: false
+        type: boolean
+        default: false
+      release_tag:
+        description: "GitHub Release tag (e.g. v1.0.0). Required when publish_release is true."
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
 
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate release inputs
+        run: |
+          if [ "${{ inputs.publish_release }}" = "true" ] && [ -z "${{ inputs.release_tag }}" ]; then
+            echo "::error::release_tag is required when publish_release is true"
+            exit 1
+          fi
+
   build:
+    needs: validate
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -28,6 +47,9 @@ jobs:
           - goos: linux
             goarch: arm64
             platform: linux-arm64
+          - goos: windows
+            goarch: amd64
+            platform: windows-amd64
 
     steps:
       - uses: actions/checkout@v4
@@ -80,7 +102,7 @@ jobs:
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: inputs.publish_release == true && inputs.release_tag != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -97,4 +119,5 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.release_tag }}
           files: dist/bundles/*
