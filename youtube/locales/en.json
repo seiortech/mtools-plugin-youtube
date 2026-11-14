@@ -1,0 +1,21 @@
+{
+  "meta": {
+    "code": "en",
+    "name": "English",
+    "author": "mtools Team"
+  },
+  "strings": {
+    "yt.name": "YouTube Downloader",
+    "yt.desc": "Download video and audio streams from YouTube and supported sites.",
+    "yt.url_label": "Video URL",
+    "yt.url_placeholder": "https://www.youtube.com/watch?v=...",
+    "yt.preview": "Preview",
+    "yt.loading": "Loading...",
+    "yt.download_video": "Download Video",
+    "yt.download_audio": "Download Audio",
+    "yt.missing_binaries": "Missing Dependencies",
+    "yt.missing_desc": "yt-dlp or ffmpeg was not found. Please install them or configure their paths in settings.",
+    "yt.store_default_path": "Store in Default Path",
+    "yt.default_path_info": "Default location: %s"
+  }
+}

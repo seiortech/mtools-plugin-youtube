@@ -1,0 +1,21 @@
+{
+  "meta": {
+    "code": "id",
+    "name": "Bahasa Indonesia",
+    "author": "mtools Team"
+  },
+  "strings": {
+    "yt.name": "Pengunduh YouTube",
+    "yt.desc": "Unduh streaming video dan audio dari YouTube dan situs yang didukung.",
+    "yt.url_label": "URL Video",
+    "yt.url_placeholder": "https://www.youtube.com/watch?v=...",
+    "yt.preview": "Pratinjau",
+    "yt.loading": "Memuat...",
+    "yt.download_video": "Unduh Video",
+    "yt.download_audio": "Unduh Audio",
+    "yt.missing_binaries": "Dependensi Tidak Ditemukan",
+    "yt.missing_desc": "yt-dlp atau ffmpeg tidak ditemukan. Silakan pasang atau konfigurasikan jalurnya di pengaturan.",
+    "yt.store_default_path": "Simpan di Jalur Default",
+    "yt.default_path_info": "Lokasi default: %s"
+  }
+}
