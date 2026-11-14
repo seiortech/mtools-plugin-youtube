@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "id": "com.mtools.youtube",
+  "name": "YouTube Downloader",
+  "version": "1.0.0",
+  "description": "Download video and audio streams from YouTube and supported sites.",
+  "publisher": {
+    "name": "mtools Team"
+  },
+  "capabilities": ["process", "files.read", "files.write", "network"],
+  "entry": {
+    "kind": "sidecar",
+    "path": "bin/tool",
+    "protocol": "jsonrpc-stdio-v1"
+  },
+  "tools": [
+    {
+      "id": "youtube",
+      "name": "YouTube Downloader",
+      "description": "Download video and audio streams from YouTube and supported sites.",
+      "category": "Media"
+    }
+  ]
+}

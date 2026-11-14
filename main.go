@@ -1,0 +1,310 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/seiortech/mtools-sdk/pluginapi"
+	"github.com/seiortech/mtools-plugin-youtube/internal/youtube"
+)
+
+type ytServer struct{}
+
+func resolveYTBinary(settings map[string]string) (string, error) {
+	bin := settings["binary_path"]
+	if bin == "" {
+		bin = settings["helper_yt-dlp"]
+	}
+	return youtube.ResolveBinary(bin, "")
+}
+
+func resolveFFmpegBinary(settings map[string]string) (string, error) {
+	bin := settings["ffmpeg_path"]
+	if bin == "" {
+		bin = settings["helper_ffmpeg"]
+	}
+	return youtube.ResolveFFmpeg(bin, "")
+}
+
+func firstInput(inputs map[string][]string, key string) string {
+	if vals := inputs[key]; len(vals) > 0 {
+		return vals[0]
+	}
+	return ""
+}
+
+func commandOptionsFromParams(p pluginapi.RunParams, bin, ffmpegBin, validURL, outDir string) youtube.CommandOptions {
+	outputFormat := firstInput(p.Inputs, "output_format")
+	if outputFormat == "" {
+		outputFormat = firstInput(p.Inputs, "format")
+	}
+	filenameTemplate := firstInput(p.Inputs, "filename_template")
+	if filenameTemplate == "" {
+		filenameTemplate = firstInput(p.Inputs, "custom_filename")
+	}
+	embedSubs := p.Settings["embed_subtitles"] == "true"
+	if v := firstInput(p.Inputs, "embed_subs"); v != "" {
+		embedSubs = v == "true"
+	}
+	cookiesBrowser := firstInput(p.Inputs, "cookies_browser")
+	if cookiesBrowser == "" {
+		cookiesBrowser = p.Settings["cookies_from_browser"]
+	}
+	proxyURL := firstInput(p.Inputs, "proxy_url")
+	if proxyURL == "" {
+		proxyURL = p.Settings["proxy_url"]
+	}
+	rateLimit := firstInput(p.Inputs, "rate_limit")
+	if rateLimit == "" {
+		rateLimit = p.Settings["rate_limit"]
+	}
+	fragStr := firstInput(p.Inputs, "concurrent_fragments")
+	if fragStr == "" {
+		fragStr = p.Settings["concurrent_fragments"]
+	}
+	frags, _ := strconv.Atoi(fragStr)
+
+	var sbCats []string
+	if rawCats := firstInput(p.Inputs, "sponsorblock_cats"); rawCats != "" {
+		for _, c := range strings.Split(rawCats, ",") {
+			if t := strings.TrimSpace(c); t != "" {
+				sbCats = append(sbCats, t)
+			}
+		}
+	}
+
+	return youtube.CommandOptions{
+		BinaryPath:          bin,
+		FFmpegPath:          ffmpegBin,
+		URL:                 validURL,
+		OutputDir:           outDir,
+		VideoStream:         firstInput(p.Inputs, "video_stream"),
+		AudioStream:         firstInput(p.Inputs, "audio_stream"),
+		OutputFormat:        outputFormat,
+		AudioQuality:        firstInput(p.Inputs, "audio_quality"),
+		EmbedSubs:           embedSubs,
+		SubLangs:            firstInput(p.Inputs, "sub_langs"),
+		WriteAutoSubs:       firstInput(p.Inputs, "write_auto_subs") == "true",
+		EmbedThumbnail:      firstInput(p.Inputs, "embed_thumbnail") == "true",
+		EmbedChapters:       firstInput(p.Inputs, "embed_chapters") == "true",
+		EmbedMetadata:       firstInput(p.Inputs, "embed_metadata") == "true",
+		SponsorBlockMode:    firstInput(p.Inputs, "sponsorblock_mode"),
+		SponsorBlockCats:    sbCats,
+		TimeRangeStart:      firstInput(p.Inputs, "time_start"),
+		TimeRangeEnd:        firstInput(p.Inputs, "time_end"),
+		ForceKeyframesCuts:  firstInput(p.Inputs, "force_keyframes_cuts") == "true",
+		CookiesFromBrowser:  cookiesBrowser,
+		CookiesFile:         firstInput(p.Inputs, "cookies_file"),
+		ProxyURL:            proxyURL,
+		RateLimit:           rateLimit,
+		ConcurrentFragments: frags,
+		CustomFilename:      filenameTemplate,
+		IsPlaylistItem:      firstInput(p.Inputs, "is_playlist_item") == "true",
+	}
+}
+
+func (s *ytServer) Inspect(ctx context.Context, p pluginapi.InspectParams) (pluginapi.InspectResult, error) {
+	res := pluginapi.InspectResult{
+		Fields:       make(map[string]pluginapi.InspectFieldUpdate),
+		Metadata:     make(map[string]string),
+		HelperStatus: make(map[string]pluginapi.HelperStatus),
+	}
+
+	bin, err := resolveYTBinary(p.Settings)
+	res.HelperStatus["yt-dlp"] = pluginapi.HelperStatus{
+		Found:   err == nil,
+		Path:    bin,
+		Message: "yt-dlp binary is required to download videos",
+	}
+
+	ffmpegBin, ffmpegErr := resolveFFmpegBinary(p.Settings)
+	res.HelperStatus["ffmpeg"] = pluginapi.HelperStatus{
+		Found:   ffmpegErr == nil,
+		Path:    ffmpegBin,
+		Message: "ffmpeg is recommended for merging, clipping, audio conversion, and metadata embedding",
+	}
+
+	rawURL := strings.Join(p.Inputs["url"], "")
+	if validURL, err := youtube.ParseURL(rawURL); err == nil {
+		outDir := p.Settings["download_dir"]
+		if outDir == "" {
+			outDir = "~/Downloads"
+		}
+		if d := firstInput(p.Inputs, "output_dir"); d != "" {
+			outDir = d
+		}
+		opts := commandOptionsFromParams(pluginapi.RunParams{Inputs: p.Inputs, Settings: p.Settings}, bin, ffmpegBin, validURL, outDir)
+		res.CommandPreview = youtube.BuildCommandString(opts)
+	}
+
+	return res, nil
+}
+
+func (s *ytServer) Run(ctx context.Context, p pluginapi.RunParams, emit func(pluginapi.Progress) error) (pluginapi.RunResult, error) {
+	if p.Tool != "youtube" {
+		return pluginapi.RunResult{}, errors.New("unsupported tool")
+	}
+
+	switch p.Action {
+	case "fetch_ytdlp":
+		outDirs := p.Inputs["output_dir"]
+		if len(outDirs) == 0 || outDirs[0] == "" {
+			return pluginapi.RunResult{}, errors.New("missing destination directory")
+		}
+		target := filepath.Join(outDirs[0], youtube.BinaryName())
+		_ = emit(pluginapi.Progress{
+			JobID:   p.JobID,
+			Done:    10,
+			Total:   100,
+			Unit:    "%",
+			Message: "Downloading yt-dlp binary...",
+			LogLine: "Connecting to GitHub releases...",
+		})
+		path, err := youtube.DownloadBinaryTo(ctx, target, func(pr pluginapi.Progress) {
+			_ = emit(pluginapi.Progress{
+				JobID:   p.JobID,
+				Done:    pr.Done,
+				Total:   pr.Total,
+				Unit:    pr.Unit,
+				Message: pr.Message,
+				LogLine: pr.Message,
+			})
+		})
+		if err != nil {
+			return pluginapi.RunResult{}, err
+		}
+		_ = emit(pluginapi.Progress{
+			JobID:   p.JobID,
+			Done:    100,
+			Total:   100,
+			Unit:    "%",
+			Message: "Download complete",
+			LogLine: fmt.Sprintf("yt-dlp ready at %s", path),
+		})
+		return pluginapi.RunResult{
+			JobID:   p.JobID,
+			Outputs: []string{path},
+			Summary: fmt.Sprintf("Downloaded yt-dlp to %s", path),
+		}, nil
+
+	case "update_ytdlp":
+		bin, err := resolveYTBinary(p.Settings)
+		if err != nil {
+			return pluginapi.RunResult{}, err
+		}
+		_ = emit(pluginapi.Progress{
+			JobID:   p.JobID,
+			Done:    20,
+			Total:   100,
+			Unit:    "%",
+			Message: "Checking for yt-dlp updates...",
+		})
+		out, err := youtube.UpdateBinary(ctx, bin)
+		if err != nil {
+			return pluginapi.RunResult{}, err
+		}
+		_ = emit(pluginapi.Progress{
+			JobID:   p.JobID,
+			Done:    100,
+			Total:   100,
+			Unit:    "%",
+			Message: "Update check complete",
+			LogLine: out,
+		})
+		return pluginapi.RunResult{
+			JobID:   p.JobID,
+			Summary: out,
+		}, nil
+
+	case "download":
+		rawURL := strings.Join(p.Inputs["url"], "")
+		validURL, err := youtube.ParseURL(rawURL)
+		if err != nil {
+			return pluginapi.RunResult{}, err
+		}
+
+		bin, err := resolveYTBinary(p.Settings)
+		if err != nil {
+			return pluginapi.RunResult{}, err
+		}
+		ffmpegBin, _ := resolveFFmpegBinary(p.Settings)
+
+		outDir := p.Settings["download_dir"]
+		if d := firstInput(p.Inputs, "output_dir"); d != "" {
+			outDir = d
+		}
+		if outDir == "" {
+			return pluginapi.RunResult{}, errors.New("missing output directory")
+		}
+
+		opts := commandOptionsFromParams(p, bin, ffmpegBin, validURL, outDir)
+		downloadJob := youtube.DownloadJob{
+			URL:                 validURL,
+			BinaryPath:          bin,
+			FFmpegPath:          ffmpegBin,
+			OutputDir:           outDir,
+			VideoStream:         opts.VideoStream,
+			AudioStream:         opts.AudioStream,
+			OutputFormat:        opts.OutputFormat,
+			AudioQuality:        opts.AudioQuality,
+			EmbedSubs:           opts.EmbedSubs,
+			SubLangs:            opts.SubLangs,
+			WriteAutoSubs:       opts.WriteAutoSubs,
+			EmbedThumbnail:      opts.EmbedThumbnail,
+			EmbedChapters:       opts.EmbedChapters,
+			EmbedMetadata:       opts.EmbedMetadata,
+			SponsorBlockMode:    opts.SponsorBlockMode,
+			SponsorBlockCats:    opts.SponsorBlockCats,
+			TimeRangeStart:      opts.TimeRangeStart,
+			TimeRangeEnd:        opts.TimeRangeEnd,
+			ForceKeyframesCuts:  opts.ForceKeyframesCuts,
+			CookiesFromBrowser:  opts.CookiesFromBrowser,
+			CookiesFile:         opts.CookiesFile,
+			ProxyURL:            opts.ProxyURL,
+			RateLimit:           opts.RateLimit,
+			ConcurrentFragments: opts.ConcurrentFragments,
+			CustomFilename:      opts.CustomFilename,
+			IsPlaylistItem:      opts.IsPlaylistItem,
+		}
+
+		res, err := downloadJob.Run(ctx, func(pr pluginapi.Progress) {
+			_ = emit(pluginapi.Progress{
+				JobID:   p.JobID,
+				Done:    pr.Done,
+				Total:   pr.Total,
+				Unit:    pr.Unit,
+				Message: pr.Message,
+				LogLine: pr.LogLine,
+			})
+		})
+		if err != nil {
+			return pluginapi.RunResult{}, err
+		}
+
+		return pluginapi.RunResult{
+			JobID:   p.JobID,
+			Outputs: res.Outputs,
+			Summary: res.Summary,
+		}, nil
+
+	default:
+		return pluginapi.RunResult{}, errors.New("unknown action")
+	}
+}
+
+func main() {
+	identity := pluginapi.InitializeResult{
+		Protocol: pluginapi.Protocol,
+		PluginID: "com.mtools.youtube",
+		Version:  "1.0.0",
+	}
+	server := &ytServer{}
+	if err := pluginapi.Serve(context.Background(), os.Stdin, os.Stdout, identity, server); err != nil {
+		os.Exit(1)
+	}
+}

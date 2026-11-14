@@ -1,0 +1,167 @@
+{
+  "schema": 1,
+  "tools": [
+    {
+      "id": "youtube",
+      "fields": [
+        {
+          "id": "url",
+          "kind": "text",
+          "label": "YouTube Video URL",
+          "required": true
+        },
+        {
+          "id": "format",
+          "kind": "select",
+          "label": "Quality / Format",
+          "default": "bestvideo+bestaudio/best",
+          "options": [
+            {
+              "label": "Best Video + Audio",
+              "value": "bestvideo+bestaudio/best"
+            },
+            {
+              "label": "1080p Video + Audio",
+              "value": "bestvideo[height<=1080]+bestaudio/best[height<=1080]"
+            },
+            {
+              "label": "720p Video + Audio",
+              "value": "bestvideo[height<=720]+bestaudio/best[height<=720]"
+            },
+            {
+              "label": "Audio Only (MP3/M4A)",
+              "value": "bestaudio/best"
+            }
+          ]
+        },
+        {
+          "id": "output_dir",
+          "kind": "directory",
+          "label": "Download Directory",
+          "required": true
+        },
+        {
+          "id": "filename_template",
+          "kind": "text",
+          "label": "Filename Template",
+          "default": "%(title)s.%(ext)s"
+        },
+        {
+          "id": "time_start",
+          "kind": "text",
+          "label": "Clip Start (HH:MM:SS)",
+          "default": ""
+        },
+        {
+          "id": "time_end",
+          "kind": "text",
+          "label": "Clip End (HH:MM:SS)",
+          "default": ""
+        },
+        {
+          "id": "sponsorblock_mode",
+          "kind": "select",
+          "label": "SponsorBlock",
+          "default": "none",
+          "options": [
+            { "label": "Off", "value": "none" },
+            { "label": "Remove segments", "value": "remove" },
+            { "label": "Mark chapters", "value": "mark" }
+          ]
+        },
+        {
+          "id": "embed_thumbnail",
+          "kind": "toggle",
+          "label": "Embed thumbnail",
+          "default": "false"
+        },
+        {
+          "id": "embed_chapters",
+          "kind": "toggle",
+          "label": "Embed chapters",
+          "default": "false"
+        },
+        {
+          "id": "embed_metadata",
+          "kind": "toggle",
+          "label": "Embed metadata",
+          "default": "false"
+        }
+      ],
+      "actions": [
+        {
+          "id": "download",
+          "label": "Download Video",
+          "inputs": ["url", "format", "output_dir", "filename_template", "time_start", "time_end", "sponsorblock_mode", "embed_thumbnail", "embed_chapters", "embed_metadata"]
+        },
+        {
+          "id": "fetch_ytdlp",
+          "label": "Download yt-dlp",
+          "inputs": ["output_dir"]
+        },
+        {
+          "id": "update_ytdlp",
+          "label": "Update yt-dlp",
+          "inputs": []
+        }
+      ],
+      "helpers": [
+        {
+          "id": "yt-dlp",
+          "name": "yt-dlp",
+          "description": "Required command-line engine for downloading videos",
+          "install_url": "https://github.com/yt-dlp/yt-dlp"
+        },
+        {
+          "id": "ffmpeg",
+          "name": "ffmpeg",
+          "description": "Recommended for merging streams, clipping, audio conversion, and embedding metadata",
+          "install_url": "https://ffmpeg.org/download.html"
+        }
+      ],
+      "settings": [
+        {
+          "id": "binary_path",
+          "kind": "file",
+          "label": "yt-dlp executable path",
+          "description": "Custom yt-dlp path. Leave empty to use auto-downloaded binary.",
+          "placeholder": "/usr/local/bin/yt-dlp",
+          "default": "",
+          "action": {
+            "id": "fetch_ytdlp",
+            "label": "Download yt-dlp",
+            "description": "Download official standalone yt-dlp binary to plugin data directory."
+          }
+        },
+        {
+          "id": "download_dir",
+          "kind": "directory",
+          "label": "Download folder",
+          "description": "Destination folder for finished media files.",
+          "default": "~/Downloads",
+          "required": true
+        },
+        {
+          "id": "quality",
+          "kind": "select",
+          "label": "Preferred quality",
+          "description": "Target video resolution when stream is available.",
+          "default": "1080",
+          "options": [
+            { "label": "Best available", "value": "best" },
+            { "label": "1080p", "value": "1080" },
+            { "label": "720p", "value": "720" },
+            { "label": "Audio only (MP3)", "value": "audio" }
+          ]
+        },
+        {
+          "id": "embed_subtitles",
+          "kind": "toggle",
+          "label": "Embed subtitles",
+          "description": "Download and embed available subtitles into output container.",
+          "default": "false"
+        }
+      ]
+    }
+  ]
+}
