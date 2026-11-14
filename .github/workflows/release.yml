@@ -71,7 +71,7 @@ jobs:
           go build -trimpath -o dist/bin/tool .
 
       - name: Install mtools-plugin CLI
-        run: go install github.com/seiortech/mtools-sdk/cmd/mtools-plugin@v0.1.0
+        run: go install github.com/seiortech/mtools-sdk/cmd/mtools-plugin@v0.1.2
 
       - name: Pack and verify signed bundle
         env:
