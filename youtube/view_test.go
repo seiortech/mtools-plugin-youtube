@@ -88,7 +88,7 @@ func TestWorkspaceJobCardWithLogs(t *testing.T) {
 		t.Fatalf("timed out waiting for dummy job")
 	}
 
-	tt := ui.NewTester(p.View, 1180, 800)
+	tt := ui.NewTester(p.View, 1180, 1000)
 	tt.Frame()
 
 	if !tt.HasText("Console Output") {
@@ -137,7 +137,7 @@ func TestWorkspacePreviewCardAndDismiss(t *testing.T) {
 		ViewCount:      1500000000,
 	}
 
-	tt := ui.NewTester(p.View, 1180, 800)
+	tt := ui.NewTester(p.View, 1180, 1000)
 	tt.Frame()
 
 	if !tt.HasText("Video Preview") {
@@ -878,7 +878,7 @@ func TestWorkspacePlaylistBatchShowsFirstJobLogs(t *testing.T) {
 		t.Fatalf("timed out waiting for first batch job to start")
 	}
 
-	tt := ui.NewTester(p.View, 1180, 800)
+	tt := ui.NewTester(p.View, 1180, 1000)
 	tt.Frame()
 
 	if !tt.HasText("Batch Download (0/2)") {
@@ -920,7 +920,7 @@ func TestWorkspacePreviewLogsAndProgress(t *testing.T) {
 	p.state.appendPreviewLog("[cmd] yt-dlp --dump-single-json --no-playlist https://youtube.com/watch?v=abc")
 	p.state.appendPreviewLog("[youtube] Extracting URL: abc")
 
-	tt := ui.NewTester(p.View, 1180, 800)
+	tt := ui.NewTester(p.View, 1180, 1000)
 	tt.Frame()
 
 	if !tt.HasText("Preview Process") {
