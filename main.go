@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/seiortech/mtools-sdk/pluginapi"
 	"github.com/seiortech/mtools-plugin-youtube/internal/youtube"
+	"github.com/seiortech/mtools-sdk/pluginapi"
 )
 
 type ytServer struct{}
@@ -20,7 +20,7 @@ func resolveYTBinary(settings map[string]string) (string, error) {
 	if bin == "" {
 		bin = settings["helper_yt-dlp"]
 	}
-	return youtube.ResolveBinary(bin, "")
+	return youtube.ResolveBinary(bin, settings["plugin_data_dir"])
 }
 
 func resolveFFmpegBinary(settings map[string]string) (string, error) {
@@ -28,7 +28,7 @@ func resolveFFmpegBinary(settings map[string]string) (string, error) {
 	if bin == "" {
 		bin = settings["helper_ffmpeg"]
 	}
-	return youtube.ResolveFFmpeg(bin, "")
+	return youtube.ResolveFFmpeg(bin, settings["plugin_data_dir"])
 }
 
 func firstInput(inputs map[string][]string, key string) string {
@@ -36,6 +36,19 @@ func firstInput(inputs map[string][]string, key string) string {
 		return vals[0]
 	}
 	return ""
+}
+
+func formatViews(views int64) string {
+	switch {
+	case views >= 1_000_000:
+		return fmt.Sprintf("%.1fM views", float64(views)/1_000_000)
+	case views >= 1_000:
+		return fmt.Sprintf("%.1fK views", float64(views)/1_000)
+	case views > 0:
+		return fmt.Sprintf("%d views", views)
+	default:
+		return ""
+	}
 }
 
 func commandOptionsFromParams(p pluginapi.RunParams, bin, ffmpegBin, validURL, outDir string) youtube.CommandOptions {
@@ -48,12 +61,17 @@ func commandOptionsFromParams(p pluginapi.RunParams, bin, ffmpegBin, validURL, o
 		filenameTemplate = firstInput(p.Inputs, "custom_filename")
 	}
 	embedSubs := p.Settings["embed_subtitles"] == "true"
-	if v := firstInput(p.Inputs, "embed_subs"); v != "" {
+	if v := firstInput(p.Inputs, "embed_subtitles"); v != "" {
+		embedSubs = v == "true"
+	} else if v := firstInput(p.Inputs, "embed_subs"); v != "" {
 		embedSubs = v == "true"
 	}
 	cookiesBrowser := firstInput(p.Inputs, "cookies_browser")
 	if cookiesBrowser == "" {
 		cookiesBrowser = p.Settings["cookies_from_browser"]
+	}
+	if cookiesBrowser == "none" {
+		cookiesBrowser = ""
 	}
 	proxyURL := firstInput(p.Inputs, "proxy_url")
 	if proxyURL == "" {
@@ -69,11 +87,18 @@ func commandOptionsFromParams(p pluginapi.RunParams, bin, ffmpegBin, validURL, o
 	}
 	frags, _ := strconv.Atoi(fragStr)
 
+	sbMode := firstInput(p.Inputs, "sponsorblock_mode")
+	if sbMode == "none" {
+		sbMode = ""
+	}
+
 	var sbCats []string
-	if rawCats := firstInput(p.Inputs, "sponsorblock_cats"); rawCats != "" {
-		for _, c := range strings.Split(rawCats, ",") {
-			if t := strings.TrimSpace(c); t != "" {
-				sbCats = append(sbCats, t)
+	if cats := p.Inputs["sponsorblock_cats"]; len(cats) > 0 {
+		for _, raw := range cats {
+			for _, c := range strings.Split(raw, ",") {
+				if t := strings.TrimSpace(c); t != "" {
+					sbCats = append(sbCats, t)
+				}
 			}
 		}
 	}
@@ -93,7 +118,7 @@ func commandOptionsFromParams(p pluginapi.RunParams, bin, ffmpegBin, validURL, o
 		EmbedThumbnail:      firstInput(p.Inputs, "embed_thumbnail") == "true",
 		EmbedChapters:       firstInput(p.Inputs, "embed_chapters") == "true",
 		EmbedMetadata:       firstInput(p.Inputs, "embed_metadata") == "true",
-		SponsorBlockMode:    firstInput(p.Inputs, "sponsorblock_mode"),
+		SponsorBlockMode:    sbMode,
 		SponsorBlockCats:    sbCats,
 		TimeRangeStart:      firstInput(p.Inputs, "time_start"),
 		TimeRangeEnd:        firstInput(p.Inputs, "time_end"),
@@ -118,28 +143,119 @@ func (s *ytServer) Inspect(ctx context.Context, p pluginapi.InspectParams) (plug
 	bin, err := resolveYTBinary(p.Settings)
 	res.HelperStatus["yt-dlp"] = pluginapi.HelperStatus{
 		Found:   err == nil,
+		Needed:  true,
 		Path:    bin,
 		Message: "yt-dlp binary is required to download videos",
 	}
 
 	ffmpegBin, ffmpegErr := resolveFFmpegBinary(p.Settings)
-	res.HelperStatus["ffmpeg"] = pluginapi.HelperStatus{
-		Found:   ffmpegErr == nil,
-		Path:    ffmpegBin,
-		Message: "ffmpeg is recommended for merging, clipping, audio conversion, and metadata embedding",
+
+	outDir := p.Settings["download_dir"]
+	if outDir == "" {
+		outDir = "~/Downloads"
+	}
+	if d := firstInput(p.Inputs, "output_dir"); d != "" {
+		outDir = d
 	}
 
 	rawURL := strings.Join(p.Inputs["url"], "")
-	if validURL, err := youtube.ParseURL(rawURL); err == nil {
-		outDir := p.Settings["download_dir"]
-		if outDir == "" {
-			outDir = "~/Downloads"
+	validURL, urlErr := youtube.ParseURL(rawURL)
+	cmdURL := "<URL>"
+	if urlErr == nil {
+		cmdURL = validURL
+	}
+	opts := commandOptionsFromParams(pluginapi.RunParams{Inputs: p.Inputs, Settings: p.Settings}, bin, ffmpegBin, cmdURL, outDir)
+	res.CommandPreview = youtube.BuildCommandString(opts)
+
+	res.HelperStatus["ffmpeg"] = pluginapi.HelperStatus{
+		Found:   ffmpegErr == nil,
+		Needed:  youtube.NeedsFFmpeg(opts),
+		Path:    ffmpegBin,
+		Message: "ffmpeg not found — required for merging streams, clipping, audio conversion, or embedding.",
+	}
+
+	if p.Action == "preview" {
+		if urlErr != nil {
+			res.Error = urlErr.Error()
+			return res, nil
 		}
-		if d := firstInput(p.Inputs, "output_dir"); d != "" {
-			outDir = d
+		if err != nil {
+			res.Error = err.Error()
+			return res, nil
 		}
-		opts := commandOptionsFromParams(pluginapi.RunParams{Inputs: p.Inputs, Settings: p.Settings}, bin, ffmpegBin, validURL, outDir)
-		res.CommandPreview = youtube.BuildCommandString(opts)
+
+		appendLog := func(line string) {
+			if len(res.Logs) < 500 {
+				res.Logs = append(res.Logs, line)
+			}
+		}
+
+		if youtube.IsPlaylistURL(validURL) {
+			appendLog(fmt.Sprintf("[cmd] %s --flat-playlist --dump-single-json %s", bin, validURL))
+			pm, pmErr := youtube.FetchPlaylistMetadataWithLogs(ctx, bin, validURL, appendLog)
+			if pmErr != nil {
+				res.Error = pmErr.Error()
+				return res, nil
+			}
+			appendLog(fmt.Sprintf("Playlist loaded: %s (%d items)", pm.Title, len(pm.Entries)))
+			res.IsPlaylist = true
+			res.Preview = &pluginapi.InspectPreview{
+				Title:       pm.Title,
+				Subtitle:    pm.Channel,
+				Meta:        []string{fmt.Sprintf("%d items", len(pm.Entries))},
+				Dismissible: true,
+			}
+			items := make([]pluginapi.SurfaceOption, 0, len(pm.Entries))
+			for _, e := range pm.Entries {
+				items = append(items, pluginapi.SurfaceOption{
+					Label: e.Title,
+					Value: e.URL,
+					Meta:  e.DurationString,
+				})
+			}
+			res.Fields["playlist_items"] = pluginapi.InspectFieldUpdate{Options: items}
+		} else {
+			appendLog(fmt.Sprintf("[cmd] %s --dump-single-json --no-playlist %s", bin, validURL))
+			meta, metaErr := youtube.FetchMetadataWithLogs(ctx, bin, validURL, appendLog)
+			if metaErr != nil {
+				res.Error = metaErr.Error()
+				return res, nil
+			}
+			appendLog(fmt.Sprintf("Metadata ready: %s", meta.Title))
+			var metaParts []string
+			if meta.DurationString != "" {
+				metaParts = append(metaParts, meta.DurationString)
+			}
+			if views := formatViews(meta.ViewCount); views != "" {
+				metaParts = append(metaParts, views)
+			}
+			res.Preview = &pluginapi.InspectPreview{
+				Title:        meta.Title,
+				Subtitle:     meta.Channel,
+				Meta:         metaParts,
+				ThumbnailURL: meta.ThumbnailURL,
+				Dismissible:  true,
+			}
+			res.Metadata["title"] = meta.Title
+			res.Metadata["channel"] = meta.Channel
+			res.Metadata["duration"] = meta.DurationString
+			vOpts := youtube.ExtractVideoOptions(meta.Formats)
+			vSurface := make([]pluginapi.SurfaceOption, 0, len(vOpts))
+			for _, o := range vOpts {
+				vSurface = append(vSurface, pluginapi.SurfaceOption{Label: o.Label, Value: o.Value})
+			}
+			aOpts := youtube.ExtractAudioOptions(meta.Formats)
+			aSurface := make([]pluginapi.SurfaceOption, 0, len(aOpts))
+			for _, o := range aOpts {
+				aSurface = append(aSurface, pluginapi.SurfaceOption{Label: o.Label, Value: o.Value})
+			}
+			if len(vSurface) > 0 {
+				res.Fields["video_stream"] = pluginapi.InspectFieldUpdate{Options: vSurface}
+			}
+			if len(aSurface) > 0 {
+				res.Fields["audio_stream"] = pluginapi.InspectFieldUpdate{Options: aSurface}
+			}
+		}
 	}
 
 	return res, nil
@@ -204,57 +320,76 @@ func (s *ytServer) Run(ctx context.Context, p pluginapi.RunParams, emit func(plu
 			outDir = d
 		}
 		if outDir == "" {
-			return pluginapi.RunResult{}, errors.New("missing output directory")
+			outDir = "~/Downloads"
 		}
 
 		opts := commandOptionsFromParams(p, bin, ffmpegBin, validURL, outDir)
-		downloadJob := youtube.DownloadJob{
-			URL:                 validURL,
-			BinaryPath:          bin,
-			FFmpegPath:          ffmpegBin,
-			OutputDir:           outDir,
-			VideoStream:         opts.VideoStream,
-			AudioStream:         opts.AudioStream,
-			OutputFormat:        opts.OutputFormat,
-			AudioQuality:        opts.AudioQuality,
-			EmbedSubs:           opts.EmbedSubs,
-			SubLangs:            opts.SubLangs,
-			WriteAutoSubs:       opts.WriteAutoSubs,
-			EmbedThumbnail:      opts.EmbedThumbnail,
-			EmbedChapters:       opts.EmbedChapters,
-			EmbedMetadata:       opts.EmbedMetadata,
-			SponsorBlockMode:    opts.SponsorBlockMode,
-			SponsorBlockCats:    opts.SponsorBlockCats,
-			TimeRangeStart:      opts.TimeRangeStart,
-			TimeRangeEnd:        opts.TimeRangeEnd,
-			ForceKeyframesCuts:  opts.ForceKeyframesCuts,
-			CookiesFromBrowser:  opts.CookiesFromBrowser,
-			CookiesFile:         opts.CookiesFile,
-			ProxyURL:            opts.ProxyURL,
-			RateLimit:           opts.RateLimit,
-			ConcurrentFragments: opts.ConcurrentFragments,
-			CustomFilename:      opts.CustomFilename,
-			IsPlaylistItem:      opts.IsPlaylistItem,
+		targets := []string{validURL}
+		isPlaylist := false
+		if items := p.Inputs["playlist_items"]; len(items) > 0 {
+			targets = items
+			isPlaylist = true
 		}
 
-		res, err := downloadJob.Run(ctx, func(pr pluginapi.Progress) {
-			_ = emit(pluginapi.Progress{
-				JobID:   p.JobID,
-				Done:    pr.Done,
-				Total:   pr.Total,
-				Unit:    pr.Unit,
-				Message: pr.Message,
-				LogLine: pr.LogLine,
+		var allOutputs []string
+		var summaries []string
+		for idx, targetURL := range targets {
+			downloadJob := youtube.DownloadJob{
+				URL:                 targetURL,
+				BinaryPath:          bin,
+				FFmpegPath:          ffmpegBin,
+				OutputDir:           outDir,
+				VideoStream:         opts.VideoStream,
+				AudioStream:         opts.AudioStream,
+				OutputFormat:        opts.OutputFormat,
+				AudioQuality:        opts.AudioQuality,
+				EmbedSubs:           opts.EmbedSubs,
+				SubLangs:            opts.SubLangs,
+				WriteAutoSubs:       opts.WriteAutoSubs,
+				EmbedThumbnail:      opts.EmbedThumbnail,
+				EmbedChapters:       opts.EmbedChapters,
+				EmbedMetadata:       opts.EmbedMetadata,
+				SponsorBlockMode:    opts.SponsorBlockMode,
+				SponsorBlockCats:    opts.SponsorBlockCats,
+				TimeRangeStart:      opts.TimeRangeStart,
+				TimeRangeEnd:        opts.TimeRangeEnd,
+				ForceKeyframesCuts:  opts.ForceKeyframesCuts,
+				CookiesFromBrowser:  opts.CookiesFromBrowser,
+				CookiesFile:         opts.CookiesFile,
+				ProxyURL:            opts.ProxyURL,
+				RateLimit:           opts.RateLimit,
+				ConcurrentFragments: opts.ConcurrentFragments,
+				CustomFilename:      opts.CustomFilename,
+				IsPlaylistItem:      isPlaylist || opts.IsPlaylistItem,
+			}
+
+			res, err := downloadJob.Run(ctx, func(pr pluginapi.Progress) {
+				msg := pr.Message
+				if len(targets) > 1 {
+					msg = fmt.Sprintf("[%d/%d] %s", idx+1, len(targets), pr.Message)
+				}
+				_ = emit(pluginapi.Progress{
+					JobID:   p.JobID,
+					Done:    pr.Done,
+					Total:   pr.Total,
+					Unit:    pr.Unit,
+					Message: msg,
+					LogLine: pr.LogLine,
+				})
 			})
-		})
-		if err != nil {
-			return pluginapi.RunResult{}, err
+			if err != nil {
+				return pluginapi.RunResult{}, err
+			}
+			allOutputs = append(allOutputs, res.Outputs...)
+			if res.Summary != "" {
+				summaries = append(summaries, res.Summary)
+			}
 		}
 
 		return pluginapi.RunResult{
 			JobID:   p.JobID,
-			Outputs: res.Outputs,
-			Summary: res.Summary,
+			Outputs: allOutputs,
+			Summary: strings.Join(summaries, "\n"),
 		}, nil
 
 	default:

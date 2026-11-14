@@ -3,96 +3,402 @@
   "tools": [
     {
       "id": "youtube",
+      "sections": [
+        {
+          "id": "main_card",
+          "layout": "card",
+          "groups": [
+            {
+              "id": "url_bar",
+              "layout": "input_row",
+              "fields": ["url"],
+              "actions": ["preview"]
+            },
+            {
+              "id": "playlist",
+              "layout": "vertical",
+              "fields": ["playlist_items"]
+            },
+            {
+              "id": "options_tabs",
+              "layout": "tabs",
+              "groups": [
+                {
+                  "id": "stream_format",
+                  "label": "Stream & Format",
+                  "layout": "vertical",
+                  "groups": [
+                    {
+                      "id": "stream_selects",
+                      "layout": "horizontal",
+                      "fields": ["video_stream", "audio_stream", "output_format", "audio_quality"]
+                    },
+                    {
+                      "id": "stream_filename",
+                      "layout": "vertical",
+                      "fields": ["filename_template"]
+                    }
+                  ]
+                },
+                {
+                  "id": "trim_post",
+                  "label": "Trim & Post-Process",
+                  "layout": "vertical",
+                  "groups": [
+                    {
+                      "id": "clip_range",
+                      "label": "Time-Range Clipping",
+                      "layout": "horizontal",
+                      "fields": ["time_start", "time_end", "force_keyframes_cuts"]
+                    },
+                    {
+                      "id": "sponsorblock",
+                      "label": "SponsorBlock",
+                      "layout": "vertical",
+                      "fields": ["sponsorblock_mode", "sponsorblock_cats"]
+                    },
+                    {
+                      "id": "subtitles_meta",
+                      "label": "Metadata & Subtitles",
+                      "layout": "vertical",
+                      "groups": [
+                        {
+                          "id": "subtitles_toggles",
+                          "layout": "wrap",
+                          "fields": ["embed_subtitles", "write_auto_subs", "embed_thumbnail", "embed_chapters", "embed_metadata"]
+                        }
+                      ],
+                      "fields": ["sub_langs"]
+                    }
+                  ]
+                },
+                {
+                  "id": "network_auth",
+                  "label": "Network & Auth",
+                  "layout": "vertical",
+                  "groups": [
+                    {
+                      "id": "net_row_1",
+                      "layout": "horizontal",
+                      "fields": ["cookies_browser", "concurrent_fragments"]
+                    },
+                    {
+                      "id": "net_row_2",
+                      "layout": "horizontal",
+                      "fields": ["proxy_url", "rate_limit"]
+                    },
+                    {
+                      "id": "net_row_3",
+                      "layout": "horizontal",
+                      "fields": ["cookies_file"],
+                      "actions": ["update_ytdlp"]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "id": "destination",
+              "layout": "vertical",
+              "fields": ["output_dir"]
+            }
+          ]
+        }
+      ],
       "fields": [
         {
           "id": "url",
           "kind": "text",
-          "label": "YouTube Video URL",
+          "label": "Video or Playlist URL",
+          "placeholder": "https://www.youtube.com/watch?v=...",
+          "grow": true,
           "required": true
-        },
-        {
-          "id": "format",
-          "kind": "select",
-          "label": "Quality / Format",
-          "default": "bestvideo+bestaudio/best",
-          "options": [
-            {
-              "label": "Best Video + Audio",
-              "value": "bestvideo+bestaudio/best"
-            },
-            {
-              "label": "1080p Video + Audio",
-              "value": "bestvideo[height<=1080]+bestaudio/best[height<=1080]"
-            },
-            {
-              "label": "720p Video + Audio",
-              "value": "bestvideo[height<=720]+bestaudio/best[height<=720]"
-            },
-            {
-              "label": "Audio Only (MP3/M4A)",
-              "value": "bestaudio/best"
-            }
-          ]
         },
         {
           "id": "output_dir",
           "kind": "directory",
-          "label": "Download Directory",
+          "label": "Save Destination",
+          "default": "~/Downloads",
           "required": true
+        },
+        {
+          "id": "playlist_items",
+          "kind": "checklist",
+          "label": "Playlist Items",
+          "dynamic": true
+        },
+        {
+          "id": "video_stream",
+          "kind": "select",
+          "label": "Video Stream",
+          "dynamic": true,
+          "grow": true,
+          "flex": 3,
+          "default": "bestvideo",
+          "options": [
+            { "label": "Auto (Best Video)", "value": "bestvideo" },
+            { "label": "1080p (Full HD)", "value": "bestvideo[height<=1080]" },
+            { "label": "720p (HD)", "value": "bestvideo[height<=720]" },
+            { "label": "480p (SD)", "value": "bestvideo[height<=480]" },
+            { "label": "Audio Only (No Video)", "value": "none" }
+          ]
+        },
+        {
+          "id": "audio_stream",
+          "kind": "select",
+          "label": "Audio Stream",
+          "dynamic": true,
+          "grow": true,
+          "flex": 2,
+          "default": "bestaudio",
+          "options": [
+            { "label": "Auto (Best Audio)", "value": "bestaudio" },
+            { "label": "None (Muted)", "value": "none" }
+          ]
+        },
+        {
+          "id": "output_format",
+          "kind": "select",
+          "label": "Format",
+          "grow": true,
+          "flex": 1,
+          "default": "mp4",
+          "options": [
+            { "label": "mp4", "value": "mp4" },
+            { "label": "mkv", "value": "mkv" },
+            { "label": "webm", "value": "webm" },
+            { "label": "mp3", "value": "mp3" },
+            { "label": "m4a", "value": "m4a" },
+            { "label": "opus", "value": "opus" },
+            { "label": "flac", "value": "flac" },
+            { "label": "wav", "value": "wav" }
+          ]
+        },
+        {
+          "id": "audio_quality",
+          "kind": "select",
+          "label": "Audio Quality",
+          "grow": true,
+          "flex": 1,
+          "default": "0",
+          "options": [
+            { "label": "Best (VBR 0)", "value": "0" },
+            { "label": "320 kbps", "value": "320K" },
+            { "label": "192 kbps", "value": "192K" },
+            { "label": "128 kbps", "value": "128K" }
+          ]
         },
         {
           "id": "filename_template",
           "kind": "text",
-          "label": "Filename Template",
-          "default": "%(title)s.%(ext)s"
+          "label": "Output Filename",
+          "hint": "(optional)",
+          "placeholder": "%(title)s",
+          "default": "",
+          "options": [
+            { "label": "Title", "value": "%(title)s" },
+            { "label": "ID", "value": "%(id)s" },
+            { "label": "Date + Title", "value": "%(upload_date)s - %(title)s" },
+            { "label": "Uploader + Title", "value": "%(uploader)s - %(title)s" },
+            { "label": "Playlist # + Title", "value": "%(playlist_index)s - %(title)s" }
+          ]
         },
         {
           "id": "time_start",
           "kind": "text",
-          "label": "Clip Start (HH:MM:SS)",
+          "label": "Clip Start",
+          "hide_label": true,
+          "grow": true,
+          "placeholder": "Start (e.g. 00:01:30)",
           "default": ""
         },
         {
           "id": "time_end",
           "kind": "text",
-          "label": "Clip End (HH:MM:SS)",
+          "label": "Clip End",
+          "hide_label": true,
+          "grow": true,
+          "placeholder": "End (e.g. 00:02:45)",
           "default": ""
         },
         {
+          "id": "force_keyframes_cuts",
+          "kind": "toggle",
+          "label": "Keyframe Cuts",
+          "hide_label": true,
+          "style": "chip",
+          "default": "false"
+        },
+        {
           "id": "sponsorblock_mode",
-          "kind": "select",
+          "kind": "choice",
           "label": "SponsorBlock",
+          "hide_label": true,
+          "style": "chip",
           "default": "none",
           "options": [
             { "label": "Off", "value": "none" },
-            { "label": "Remove segments", "value": "remove" },
-            { "label": "Mark chapters", "value": "mark" }
+            { "label": "Remove", "value": "remove" },
+            { "label": "Mark Chapters", "value": "mark" }
           ]
+        },
+        {
+          "id": "sponsorblock_cats",
+          "kind": "chips",
+          "label": "SponsorBlock Categories",
+          "hide_label": true,
+          "style": "chip",
+          "default": "sponsor",
+          "visible_when": { "field": "sponsorblock_mode", "not_equals": "none" },
+          "options": [
+            { "label": "sponsor", "value": "sponsor" },
+            { "label": "intro", "value": "intro" },
+            { "label": "outro", "value": "outro" },
+            { "label": "selfpromo", "value": "selfpromo" },
+            { "label": "interaction", "value": "interaction" },
+            { "label": "music_offtopic", "value": "music_offtopic" }
+          ]
+        },
+        {
+          "id": "embed_subtitles",
+          "kind": "toggle",
+          "label": "Embed Subtitles",
+          "hide_label": true,
+          "style": "chip",
+          "default": "false"
+        },
+        {
+          "id": "write_auto_subs",
+          "kind": "toggle",
+          "label": "Auto Subs",
+          "hide_label": true,
+          "style": "chip",
+          "default": "false"
+        },
+        {
+          "id": "sub_langs",
+          "kind": "text",
+          "label": "Subtitle Languages",
+          "hide_label": true,
+          "placeholder": "Subtitle languages (e.g. en,id)",
+          "default": "en",
+          "visible_when": { "field": "embed_subtitles", "equals": "true" }
         },
         {
           "id": "embed_thumbnail",
           "kind": "toggle",
-          "label": "Embed thumbnail",
+          "label": "Thumbnail",
+          "hide_label": true,
+          "style": "chip",
           "default": "false"
         },
         {
           "id": "embed_chapters",
           "kind": "toggle",
-          "label": "Embed chapters",
+          "label": "Chapters",
+          "hide_label": true,
+          "style": "chip",
           "default": "false"
         },
         {
           "id": "embed_metadata",
           "kind": "toggle",
-          "label": "Embed metadata",
+          "label": "Metadata",
+          "hide_label": true,
+          "style": "chip",
           "default": "false"
+        },
+        {
+          "id": "cookies_browser",
+          "kind": "select",
+          "label": "Browser Cookies",
+          "grow": true,
+          "default": "none",
+          "options": [
+            { "label": "None", "value": "none" },
+            { "label": "Chrome", "value": "chrome" },
+            { "label": "Firefox", "value": "firefox" },
+            { "label": "Safari", "value": "safari" },
+            { "label": "Edge", "value": "edge" },
+            { "label": "Brave", "value": "brave" }
+          ]
+        },
+        {
+          "id": "concurrent_fragments",
+          "kind": "select",
+          "label": "Concurrent Fragments",
+          "grow": true,
+          "default": "1",
+          "options": [
+            { "label": "1 (Default)", "value": "1" },
+            { "label": "2x", "value": "2" },
+            { "label": "4x", "value": "4" },
+            { "label": "8x", "value": "8" }
+          ]
+        },
+        {
+          "id": "proxy_url",
+          "kind": "text",
+          "label": "Proxy URL",
+          "grow": true,
+          "placeholder": "http://127.0.0.1:8080 or socks5://...",
+          "default": ""
+        },
+        {
+          "id": "rate_limit",
+          "kind": "text",
+          "label": "Rate Limit",
+          "grow": true,
+          "placeholder": "e.g. 5M or 500K",
+          "default": ""
+        },
+        {
+          "id": "cookies_file",
+          "kind": "file",
+          "label": "Cookies File",
+          "hide_label": true,
+          "grow": true,
+          "placeholder": "No cookies.txt selected",
+          "default": ""
         }
       ],
       "actions": [
         {
+          "id": "preview",
+          "label": "Preview",
+          "kind": "inspect",
+          "inputs": ["url"]
+        },
+        {
           "id": "download",
           "label": "Download Video",
-          "inputs": ["url", "format", "output_dir", "filename_template", "time_start", "time_end", "sponsorblock_mode", "embed_thumbnail", "embed_chapters", "embed_metadata"]
+          "kind": "run",
+          "inputs": [
+            "url",
+            "output_dir",
+            "playlist_items",
+            "video_stream",
+            "audio_stream",
+            "output_format",
+            "audio_quality",
+            "filename_template",
+            "time_start",
+            "time_end",
+            "force_keyframes_cuts",
+            "sponsorblock_mode",
+            "sponsorblock_cats",
+            "embed_subtitles",
+            "write_auto_subs",
+            "sub_langs",
+            "embed_thumbnail",
+            "embed_chapters",
+            "embed_metadata",
+            "cookies_browser",
+            "concurrent_fragments",
+            "proxy_url",
+            "rate_limit",
+            "cookies_file"
+          ]
         },
         {
           "id": "fetch_ytdlp",
@@ -115,13 +421,15 @@
           "id": "yt-dlp",
           "name": "yt-dlp",
           "description": "Required command-line engine for downloading videos",
-          "install_url": "https://github.com/yt-dlp/yt-dlp"
+          "install_url": "https://github.com/yt-dlp/yt-dlp",
+          "required": true
         },
         {
           "id": "ffmpeg",
           "name": "ffmpeg",
-          "description": "Recommended for merging streams, clipping, audio conversion, and embedding metadata",
-          "install_url": "https://ffmpeg.org/download.html"
+          "description": "ffmpeg not found — required for merging streams, clipping, audio conversion, or embedding.",
+          "install_url": "https://ffmpeg.org/download.html",
+          "required": false
         }
       ],
       "settings": [
@@ -179,7 +487,14 @@
           "description": "Download and embed available subtitles into output container.",
           "default": "false"
         }
-      ]
+      ],
+      "history": {
+        "title": "Download History",
+        "empty_title": "No downloads yet",
+        "empty_subtitle": "Completed videos will appear here.",
+        "show_hide": false,
+        "default_width": 320
+      }
     }
   ]
 }
