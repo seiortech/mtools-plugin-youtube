@@ -50,6 +50,9 @@ jobs:
           - goos: windows
             goarch: amd64
             platform: windows-amd64
+          - goos: windows
+            goarch: arm64
+            platform: windows-arm64
 
     steps:
       - uses: actions/checkout@v4
