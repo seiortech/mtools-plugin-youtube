@@ -1,6 +1,7 @@
 package youtube
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
 	"context"
@@ -209,25 +210,213 @@ func DownloadBinaryTo(ctx context.Context, targetPath string, progress func(plug
 	}
 
 	tempPath := targetPath + ".tmp"
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, assetURL, nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to create download request: %w", err)
+	if err := downloadURLToTempFile(ctx, assetURL, tempPath, 0755, progress); err != nil {
+		return "", err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	if err := os.Chmod(tempPath, 0755); err != nil {
+		_ = os.Remove(tempPath)
+		return "", fmt.Errorf("failed to make binary executable: %w", err)
+	}
+
+	if err := os.Rename(tempPath, targetPath); err != nil {
+		_ = os.Remove(tempPath)
+		return "", fmt.Errorf("failed to replace binary: %w", err)
+	}
+
+	return targetPath, nil
+}
+
+const maxFFmpegArchiveBytes = 256 << 20 // 256 MiB safety cap
+
+// FFmpegReleaseAssetURL returns the standalone ffmpeg .zip release URL for the host OS/arch.
+func FFmpegReleaseAssetURL() (string, error) {
+	switch runtime.GOOS {
+	case "darwin":
+		return "https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v6.1/ffmpeg-6.1-macos-64.zip", nil
+	case "linux":
+		switch runtime.GOARCH {
+		case "arm64":
+			return "https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v6.1/ffmpeg-6.1-linux-arm-64.zip", nil
+		case "amd64":
+			return "https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v6.1/ffmpeg-6.1-linux-64.zip", nil
+		default:
+			return "", fmt.Errorf("unsupported Linux architecture %q for ffmpeg auto-download", runtime.GOARCH)
+		}
+	case "windows":
+		return "https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v6.1/ffmpeg-6.1-win-64.zip", nil
+	default:
+		return "", fmt.Errorf("unsupported OS %q for ffmpeg auto-download", runtime.GOOS)
+	}
+}
+
+// DownloadFFmpegTo downloads the standalone ffmpeg binary for the current OS/arch into targetPath.
+func DownloadFFmpegTo(ctx context.Context, targetPath string, progress func(pluginapi.Progress)) (string, error) {
+	assetURL, err := FFmpegReleaseAssetURL()
 	if err != nil {
-		return "", fmt.Errorf("download request failed: %w", err)
+		return "", err
+	}
+	return DownloadFFmpegFromURLTo(ctx, assetURL, targetPath, progress)
+}
+
+// DownloadFFmpegFromURLTo downloads a .zip archive from assetURL and atomically installs the ffmpeg binary to targetPath.
+func DownloadFFmpegFromURLTo(ctx context.Context, assetURL, targetPath string, progress func(pluginapi.Progress)) (string, error) {
+	return downloadFFmpegFromURLWithClient(ctx, http.DefaultClient, assetURL, targetPath, progress)
+}
+
+func downloadFFmpegFromURLWithClient(ctx context.Context, client *http.Client, assetURL, targetPath string, progress func(pluginapi.Progress)) (string, error) {
+	binDir := filepath.Dir(targetPath)
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create destination directory: %w", err)
+	}
+
+	tempZip := targetPath + ".zip.tmp"
+	defer func() { _ = os.Remove(tempZip) }()
+
+	if err := downloadURLToTempFileWithClient(ctx, client, assetURL, tempZip, 0600, func(pr pluginapi.Progress) {
+		if progress != nil {
+			// Scale download phase to 0..85% so extraction has room up to 100%.
+			pr.Done = pr.Done * 0.85
+			progress(pr)
+		}
+	}); err != nil {
+		return "", err
+	}
+
+	if progress != nil {
+		progress(pluginapi.Progress{
+			Done:    90,
+			Total:   100,
+			Unit:    "%",
+			Message: "Extracting ffmpeg binary...",
+		})
+	}
+
+	if err := extractFFmpegFromZip(ctx, tempZip, targetPath); err != nil {
+		return "", err
+	}
+
+	return targetPath, nil
+}
+
+func extractFFmpegFromZip(ctx context.Context, zipPath, targetPath string) error {
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return fmt.Errorf("failed to open ffmpeg archive: %w", err)
+	}
+	defer zr.Close()
+
+	wantName := FFmpegBinaryName()
+	var matched *zip.File
+	for _, f := range zr.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		if strings.Contains(f.Name, "..") {
+			return fmt.Errorf("invalid archive entry path %q", f.Name)
+		}
+		if filepath.Base(f.Name) == wantName {
+			matched = f
+			break
+		}
+	}
+	if matched == nil {
+		return fmt.Errorf("ffmpeg archive missing %q executable", wantName)
+	}
+	if matched.UncompressedSize64 > maxFFmpegArchiveBytes {
+		return fmt.Errorf("ffmpeg binary exceeds %d MiB limit", maxFFmpegArchiveBytes>>20)
+	}
+
+	rc, err := matched.Open()
+	if err != nil {
+		return fmt.Errorf("failed to read ffmpeg from archive: %w", err)
+	}
+	defer rc.Close()
+
+	tempBin := targetPath + ".tmp"
+	out, err := os.OpenFile(tempBin, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
+	if err != nil {
+		return fmt.Errorf("failed to create temp binary: %w", err)
+	}
+
+	limited := io.LimitReader(rc, maxFFmpegArchiveBytes+1)
+	buf := make([]byte, 32*1024)
+	var written int64
+	for {
+		select {
+		case <-ctx.Done():
+			out.Close()
+			_ = os.Remove(tempBin)
+			return ctx.Err()
+		default:
+		}
+		n, rErr := limited.Read(buf)
+		if n > 0 {
+			written += int64(n)
+			if written > maxFFmpegArchiveBytes {
+				out.Close()
+				_ = os.Remove(tempBin)
+				return fmt.Errorf("ffmpeg binary exceeds %d MiB limit", maxFFmpegArchiveBytes>>20)
+			}
+			if _, wErr := out.Write(buf[:n]); wErr != nil {
+				out.Close()
+				_ = os.Remove(tempBin)
+				return fmt.Errorf("failed to write extracted binary: %w", wErr)
+			}
+		}
+		if rErr != nil {
+			if errors.Is(rErr, io.EOF) {
+				break
+			}
+			out.Close()
+			_ = os.Remove(tempBin)
+			return fmt.Errorf("failed to extract ffmpeg binary: %w", rErr)
+		}
+	}
+
+	if err := out.Sync(); err != nil {
+		out.Close()
+		_ = os.Remove(tempBin)
+		return fmt.Errorf("failed to sync extracted binary: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(tempBin)
+		return fmt.Errorf("failed to close extracted binary: %w", err)
+	}
+	if err := os.Chmod(tempBin, 0755); err != nil {
+		_ = os.Remove(tempBin)
+		return fmt.Errorf("failed to make extracted binary executable: %w", err)
+	}
+	if err := os.Rename(tempBin, targetPath); err != nil {
+		_ = os.Remove(tempBin)
+		return fmt.Errorf("failed to install ffmpeg binary: %w", err)
+	}
+	return nil
+}
+
+func downloadURLToTempFile(ctx context.Context, assetURL, tempPath string, mode os.FileMode, progress func(pluginapi.Progress)) error {
+	return downloadURLToTempFileWithClient(ctx, http.DefaultClient, assetURL, tempPath, mode, progress)
+}
+
+func downloadURLToTempFileWithClient(ctx context.Context, client *http.Client, assetURL, tempPath string, mode os.FileMode, progress func(pluginapi.Progress)) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, assetURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create download request: %w", err)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("download request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("download server returned HTTP %d", resp.StatusCode)
+		return fmt.Errorf("download server returned HTTP %d", resp.StatusCode)
 	}
 
-	f, err := os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
+	f, err := os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
-		return "", fmt.Errorf("failed to create temp binary: %w", err)
+		return fmt.Errorf("failed to create temp file: %w", err)
 	}
 
 	total := float64(resp.ContentLength)
@@ -239,7 +428,7 @@ func DownloadBinaryTo(ctx context.Context, targetPath string, progress func(plug
 		case <-ctx.Done():
 			f.Close()
 			_ = os.Remove(tempPath)
-			return "", ctx.Err()
+			return ctx.Err()
 		default:
 		}
 
@@ -248,7 +437,7 @@ func DownloadBinaryTo(ctx context.Context, targetPath string, progress func(plug
 			if _, wErr := f.Write(buf[:n]); wErr != nil {
 				f.Close()
 				_ = os.Remove(tempPath)
-				return "", fmt.Errorf("failed to write to binary: %w", wErr)
+				return fmt.Errorf("failed to write download: %w", wErr)
 			}
 			downloaded += int64(n)
 			if progress != nil && total > 0 {
@@ -267,32 +456,22 @@ func DownloadBinaryTo(ctx context.Context, targetPath string, progress func(plug
 			}
 			f.Close()
 			_ = os.Remove(tempPath)
-			return "", fmt.Errorf("error reading response stream: %w", rErr)
+			return fmt.Errorf("error reading response stream: %w", rErr)
 		}
 	}
 
 	if err := f.Sync(); err != nil {
 		f.Close()
 		_ = os.Remove(tempPath)
-		return "", fmt.Errorf("failed to sync binary: %w", err)
+		return fmt.Errorf("failed to sync download: %w", err)
 	}
 
 	if err := f.Close(); err != nil {
 		_ = os.Remove(tempPath)
-		return "", fmt.Errorf("failed to close binary: %w", err)
+		return fmt.Errorf("failed to close download: %w", err)
 	}
 
-	if err := os.Chmod(tempPath, 0755); err != nil {
-		_ = os.Remove(tempPath)
-		return "", fmt.Errorf("failed to make binary executable: %w", err)
-	}
-
-	if err := os.Rename(tempPath, targetPath); err != nil {
-		_ = os.Remove(tempPath)
-		return "", fmt.Errorf("failed to replace binary: %w", err)
-	}
-
-	return targetPath, nil
+	return nil
 }
 
 // DownloadBinary downloads the official yt-dlp standalone executable into plugin data dir (root).

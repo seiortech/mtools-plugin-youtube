@@ -152,45 +152,10 @@ func (s *ytServer) Run(ctx context.Context, p pluginapi.RunParams, emit func(plu
 
 	switch p.Action {
 	case "fetch_ytdlp":
-		outDirs := p.Inputs["output_dir"]
-		if len(outDirs) == 0 || outDirs[0] == "" {
-			return pluginapi.RunResult{}, errors.New("missing destination directory")
-		}
-		target := filepath.Join(outDirs[0], youtube.BinaryName())
-		_ = emit(pluginapi.Progress{
-			JobID:   p.JobID,
-			Done:    10,
-			Total:   100,
-			Unit:    "%",
-			Message: "Downloading yt-dlp binary...",
-			LogLine: "Connecting to GitHub releases...",
-		})
-		path, err := youtube.DownloadBinaryTo(ctx, target, func(pr pluginapi.Progress) {
-			_ = emit(pluginapi.Progress{
-				JobID:   p.JobID,
-				Done:    pr.Done,
-				Total:   pr.Total,
-				Unit:    pr.Unit,
-				Message: pr.Message,
-				LogLine: pr.Message,
-			})
-		})
-		if err != nil {
-			return pluginapi.RunResult{}, err
-		}
-		_ = emit(pluginapi.Progress{
-			JobID:   p.JobID,
-			Done:    100,
-			Total:   100,
-			Unit:    "%",
-			Message: "Download complete",
-			LogLine: fmt.Sprintf("yt-dlp ready at %s", path),
-		})
-		return pluginapi.RunResult{
-			JobID:   p.JobID,
-			Outputs: []string{path},
-			Summary: fmt.Sprintf("Downloaded yt-dlp to %s", path),
-		}, nil
+		return runBinaryDownload(ctx, p, youtube.BinaryName(), "yt-dlp", "Connecting to GitHub releases...", youtube.DownloadBinaryTo, emit)
+
+	case "fetch_ffmpeg":
+		return runBinaryDownload(ctx, p, youtube.FFmpegBinaryName(), "ffmpeg", "Connecting to ffmpeg release...", youtube.DownloadFFmpegTo, emit)
 
 	case "update_ytdlp":
 		bin, err := resolveYTBinary(p.Settings)
@@ -295,6 +260,54 @@ func (s *ytServer) Run(ctx context.Context, p pluginapi.RunParams, emit func(plu
 	default:
 		return pluginapi.RunResult{}, errors.New("unknown action")
 	}
+}
+
+func runBinaryDownload(
+	ctx context.Context,
+	p pluginapi.RunParams,
+	binName, displayName, connectLog string,
+	downloadFn func(context.Context, string, func(pluginapi.Progress)) (string, error),
+	emit func(pluginapi.Progress) error,
+) (pluginapi.RunResult, error) {
+	outDirs := p.Inputs["output_dir"]
+	if len(outDirs) == 0 || outDirs[0] == "" {
+		return pluginapi.RunResult{}, errors.New("missing destination directory")
+	}
+	target := filepath.Join(outDirs[0], binName)
+	_ = emit(pluginapi.Progress{
+		JobID:   p.JobID,
+		Done:    10,
+		Total:   100,
+		Unit:    "%",
+		Message: fmt.Sprintf("Downloading %s binary...", displayName),
+		LogLine: connectLog,
+	})
+	path, err := downloadFn(ctx, target, func(pr pluginapi.Progress) {
+		_ = emit(pluginapi.Progress{
+			JobID:   p.JobID,
+			Done:    pr.Done,
+			Total:   pr.Total,
+			Unit:    pr.Unit,
+			Message: pr.Message,
+			LogLine: pr.Message,
+		})
+	})
+	if err != nil {
+		return pluginapi.RunResult{}, err
+	}
+	_ = emit(pluginapi.Progress{
+		JobID:   p.JobID,
+		Done:    100,
+		Total:   100,
+		Unit:    "%",
+		Message: "Download complete",
+		LogLine: fmt.Sprintf("%s ready at %s", displayName, path),
+	})
+	return pluginapi.RunResult{
+		JobID:   p.JobID,
+		Outputs: []string{path},
+		Summary: fmt.Sprintf("Downloaded %s to %s", displayName, path),
+	}, nil
 }
 
 func main() {

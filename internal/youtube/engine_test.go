@@ -1,8 +1,12 @@
 package youtube
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"errors"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -394,5 +398,111 @@ echo '{"id":"pl1","title":"Test Playlist","entries":[{"id":"v1","title":"Item 1"
 	}
 	if len(logs) == 0 || !strings.Contains(logs[0], "[youtube:tab] Extracting URL") {
 		t.Fatalf("expected playlist stderr log, got: %v", logs)
+	}
+}
+
+func TestFFmpegReleaseAssetURL(t *testing.T) {
+	u, err := FFmpegReleaseAssetURL()
+	if err != nil {
+		t.Fatalf("FFmpegReleaseAssetURL failed: %v", err)
+	}
+	if !strings.HasPrefix(u, "https://") || !strings.HasSuffix(u, ".zip") {
+		t.Fatalf("unexpected ffmpeg release URL: %q", u)
+	}
+}
+
+func buildTestZip(t *testing.T, entries map[string]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for name, content := range entries {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatalf("zip create %q: %v", name, err)
+		}
+		if _, err := w.Write([]byte(content)); err != nil {
+			t.Fatalf("zip write %q: %v", name, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func TestDownloadFFmpegFromURLTo(t *testing.T) {
+	payload := "#!/bin/sh\necho ffmpeg\n"
+	zipBytes := buildTestZip(t, map[string]string{
+		FFmpegBinaryName(): payload,
+	})
+	emptyZip := buildTestZip(t, map[string]string{"other.txt": "hello"})
+	badZip := buildTestZip(t, map[string]string{"../" + FFmpegBinaryName(): payload})
+
+	client := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			var body []byte
+			status := http.StatusOK
+			switch r.URL.Path {
+			case "/ok.zip":
+				body = zipBytes
+			case "/missing.zip":
+				body = emptyZip
+			case "/traversal.zip":
+				body = badZip
+			default:
+				status = http.StatusNotFound
+			}
+			return &http.Response{
+				StatusCode:    status,
+				ContentLength: int64(len(body)),
+				Body:          io.NopCloser(bytes.NewReader(body)),
+			}, nil
+		}),
+	}
+
+	tmp := t.TempDir()
+	target := filepath.Join(tmp, FFmpegBinaryName())
+
+	got, err := downloadFFmpegFromURLWithClient(context.Background(), client, "https://example.test/ok.zip", target, nil)
+	if err != nil {
+		t.Fatalf("downloadFFmpegFromURLWithClient failed: %v", err)
+	}
+	if got != target {
+		t.Fatalf("expected %q, got %q", target, got)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read installed ffmpeg: %v", err)
+	}
+	if string(data) != payload {
+		t.Fatalf("unexpected payload %q", string(data))
+	}
+	if runtime.GOOS != "windows" {
+		fi, err := os.Stat(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm()&0111 == 0 {
+			t.Fatalf("expected executable bit on %q, got mode %v", target, fi.Mode())
+		}
+	}
+	if _, err := os.Stat(target + ".zip.tmp"); !os.IsNotExist(err) {
+		t.Fatalf("expected temp zip cleaned up")
+	}
+
+	if _, err := downloadFFmpegFromURLWithClient(context.Background(), client, "https://example.test/missing.zip", filepath.Join(tmp, "m"), nil); err == nil {
+		t.Fatalf("expected error when archive lacks ffmpeg binary")
+	}
+	if _, err := downloadFFmpegFromURLWithClient(context.Background(), client, "https://example.test/traversal.zip", filepath.Join(tmp, "t"), nil); err == nil {
+		t.Fatalf("expected error on path traversal entry")
+	}
+	if _, err := downloadFFmpegFromURLWithClient(context.Background(), client, "https://example.test/404.zip", filepath.Join(tmp, "nf"), nil); err == nil {
+		t.Fatalf("expected error on HTTP 404")
 	}
 }

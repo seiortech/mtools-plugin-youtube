@@ -100,6 +100,11 @@
           "inputs": ["output_dir"]
         },
         {
+          "id": "fetch_ffmpeg",
+          "label": "Download ffmpeg",
+          "inputs": ["output_dir"]
+        },
+        {
           "id": "update_ytdlp",
           "label": "Update yt-dlp",
           "inputs": []
@@ -131,6 +136,19 @@
             "id": "fetch_ytdlp",
             "label": "Download yt-dlp",
             "description": "Download official standalone yt-dlp binary to plugin data directory."
+          }
+        },
+        {
+          "id": "ffmpeg_path",
+          "kind": "file",
+          "label": "ffmpeg executable path",
+          "description": "Custom ffmpeg path for merging streams, clipping, audio conversion, and metadata embedding.",
+          "placeholder": "/usr/local/bin/ffmpeg",
+          "default": "",
+          "action": {
+            "id": "fetch_ffmpeg",
+            "label": "Download ffmpeg",
+            "description": "Download standalone ffmpeg binary to plugin data directory."
           }
         },
         {
