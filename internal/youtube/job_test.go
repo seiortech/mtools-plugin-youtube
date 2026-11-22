@@ -2,12 +2,14 @@ package youtube
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/seiortech/mtools-sdk/pluginapi"
 )
@@ -168,9 +170,11 @@ echo "100.0%|10.0MiB/s|00:00"
 	var logs []string
 	var lastMsg string
 	dl := DownloadJob{
-		URL:        "https://www.youtube.com/watch?v=abc",
-		BinaryPath: bin,
-		OutputDir:  tmp,
+		CommandOptions: CommandOptions{
+			URL:        "https://www.youtube.com/watch?v=abc",
+			BinaryPath: bin,
+			OutputDir:  tmp,
+		},
 	}
 	res, err := dl.Run(context.Background(), func(p pluginapi.Progress) {
 		mu.Lock()
@@ -202,5 +206,124 @@ echo "100.0%|10.0MiB/s|00:00"
 	}
 	if lastMsg == "" {
 		t.Errorf("expected non-empty progress message")
+	}
+}
+
+func TestClassifyError(t *testing.T) {
+	// ExtractLastError should prefer ERROR: over earlier WARNING: lines.
+	stderr := strings.Join([]string{
+		"WARNING: [youtube] Falling back to generic n function",
+		"WARNING: Some long warning message that would have filled 200 bytes easily if we didn't extract ERROR:",
+		"ERROR: [youtube] abc: HTTP Error 429: Too Many Requests",
+	}, "\n")
+
+	kind, msg := ClassifyError(errors.New("exit status 1"), stderr)
+	if kind != ErrKindRetryable {
+		t.Fatalf("expected ErrKindRetryable for HTTP 429, got %v (%s)", kind, msg)
+	}
+	if !strings.Contains(msg, "HTTP Error 429") {
+		t.Fatalf("expected ERROR line in message, got %q", msg)
+	}
+
+	kindPerm, msgPerm := ClassifyError(errors.New("exit status 1"), "ERROR: Private video. Sign in if you've been granted access")
+	if kindPerm != ErrKindPermanent {
+		t.Fatalf("expected ErrKindPermanent for private video, got %v (%s)", kindPerm, msgPerm)
+	}
+}
+
+func TestDownloadJobRetryAndResume(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script fixture requires POSIX shell")
+	}
+
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "yt-dlp")
+	outFile := filepath.Join(tmp, "video.mp4")
+	partFile := outFile + ".part"
+	marker := filepath.Join(tmp, "attempts.txt")
+
+	script := `#!/bin/sh
+echo "[download] Destination: ` + outFile + `"
+if [ ! -f "` + marker + `" ]; then
+  echo "1" > "` + marker + `"
+  echo "partial" > "` + partFile + `"
+  echo "ERROR: HTTP Error 503: Service Unavailable" >&2
+  exit 1
+fi
+if [ ! -f "` + partFile + `" ]; then
+  echo "ERROR: part file was deleted before retry!" >&2
+  exit 2
+fi
+rm -f "` + partFile + `"
+echo "complete" > "` + outFile + `"
+echo "100.0%|10.0MiB/s|00:00"
+`
+	if err := os.WriteFile(bin, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	dl := DownloadJob{
+		CommandOptions: CommandOptions{
+			URL:        "https://www.youtube.com/watch?v=abc",
+			BinaryPath: bin,
+			OutputDir:  tmp,
+		},
+	}
+	policy := RetryPolicy{MaxAttempts: 2, BaseDelay: 10 * time.Millisecond, MaxDelay: 20 * time.Millisecond}
+	res, err := dl.RunWithRetry(context.Background(), policy, nil)
+	if err != nil {
+		t.Fatalf("RunWithRetry failed: %v", err)
+	}
+	if len(res.Outputs) == 0 || res.Outputs[0] != outFile {
+		t.Fatalf("unexpected outputs: %+v", res.Outputs)
+	}
+}
+
+func TestDownloadJobCancelCleansOnlyOwnPartialFiles(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script fixture requires POSIX shell")
+	}
+
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "yt-dlp")
+	ownDest := filepath.Join(tmp, "this_job.mp4")
+	ownPart := ownDest + ".part"
+	unrelatedPart := filepath.Join(tmp, "other_browser_download.mp4.part")
+
+	if err := os.WriteFile(unrelatedPart, []byte("keep-me"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	script := `#!/bin/sh
+echo "[download] Destination: ` + ownDest + `"
+echo "partial" > "` + ownPart + `"
+sleep 5
+`
+	if err := os.WriteFile(bin, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	dl := DownloadJob{
+		CommandOptions: CommandOptions{
+			URL:        "https://www.youtube.com/watch?v=abc",
+			BinaryPath: bin,
+			OutputDir:  tmp,
+		},
+	}
+
+	_, err := dl.Run(ctx, func(p pluginapi.Progress) {
+		if strings.Contains(p.LogLine, "[download] Destination:") {
+			cancel()
+		}
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if _, statErr := os.Stat(ownPart); !os.IsNotExist(statErr) {
+		t.Fatalf("expected job's own .part file to be removed on cancel")
+	}
+	if _, statErr := os.Stat(unrelatedPart); statErr != nil {
+		t.Fatalf("unrelated .part file in outDir must NOT be deleted on cancel: %v", statErr)
 	}
 }

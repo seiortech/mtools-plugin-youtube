@@ -21,6 +21,8 @@ func TestParseURL(t *testing.T) {
 		"http://youtube.com/watch?v=dQw4w9WgXcQ",
 		"https://m.youtube.com/watch?v=dQw4w9WgXcQ",
 		"https://youtu.be/dQw4w9WgXcQ",
+		"https://music.youtube.com/watch?v=dQw4w9WgXcQ",
+		"https://vimeo.com/12345",
 	}
 
 	for _, u := range valid {
@@ -37,8 +39,8 @@ func TestParseURL(t *testing.T) {
 		"",
 		"not-a-url",
 		"ftp://youtube.com/watch?v=dQw4w9WgXcQ",
-		"https://vimeo.com/12345",
-		"https://malicious-youtube.com/watch",
+		"javascript:alert(1)",
+		"--exec=whoami",
 	}
 
 	for _, u := range invalid {
@@ -504,5 +506,79 @@ func TestDownloadFFmpegFromURLTo(t *testing.T) {
 	}
 	if _, err := downloadFFmpegFromURLWithClient(context.Background(), client, "https://example.test/404.zip", filepath.Join(tmp, "nf"), nil); err == nil {
 		t.Fatalf("expected error on HTTP 404")
+	}
+}
+
+func TestBuildArgsAudioOnlyOverridesVideoStream(t *testing.T) {
+	args := BuildArgs(CommandOptions{
+		URL:          "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+		VideoStream:  "bestvideo",
+		AudioStream:  "bestaudio",
+		OutputFormat: "mp3",
+		AudioQuality: "320K",
+	})
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-x --audio-format mp3") {
+		t.Fatalf("expected -x --audio-format mp3, got %s", joined)
+	}
+	if strings.Contains(joined, "bestvideo+bestaudio") {
+		t.Fatalf("must not request video stream when audio-only format is selected: %s", joined)
+	}
+	if !strings.Contains(joined, "--continue") {
+		t.Fatalf("expected --continue flag in args: %s", joined)
+	}
+	if !strings.Contains(joined, "-- https://www.youtube.com/watch?v=dQw4w9WgXcQ") {
+		t.Fatalf("expected -- separator before URL: %s", joined)
+	}
+}
+
+func TestDownloadHTTPResume(t *testing.T) {
+	payload := strings.Repeat("0123456789abcdef", 4096) // 64 KiB
+	split := len(payload) / 2
+	var attempts int
+
+	client := &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			attempts++
+			rangeHdr := req.Header.Get("Range")
+			if attempts == 1 {
+				// First attempt returns only half the body then errors.
+				pr, pw := io.Pipe()
+				go func() {
+					_, _ = pw.Write([]byte(payload[:split]))
+					_ = pw.CloseWithError(errors.New("simulated connection reset"))
+				}()
+				return &http.Response{
+					StatusCode:    http.StatusOK,
+					ContentLength: int64(len(payload)),
+					Body:          pr,
+					Header:        make(http.Header),
+				}, nil
+			}
+			if rangeHdr != "bytes=32768-" {
+				t.Errorf("expected Range header bytes=32768-, got %q", rangeHdr)
+			}
+			return &http.Response{
+				StatusCode:    http.StatusPartialContent,
+				ContentLength: int64(len(payload) - split),
+				Body:          io.NopCloser(strings.NewReader(payload[split:])),
+				Header:        make(http.Header),
+			}, nil
+		}),
+	}
+
+	tmp := filepath.Join(t.TempDir(), "bin.tmp")
+	if err := downloadURLToTempFileWithClient(context.Background(), client, "https://example.test/bin", tmp, 0644, nil); err != nil {
+		t.Fatalf("downloadURLToTempFileWithClient failed: %v", err)
+	}
+	got, err := os.ReadFile(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != payload {
+		t.Fatalf("resumed payload mismatch: got %d bytes, want %d", len(got), len(payload))
+	}
+	if attempts != 2 {
+		t.Fatalf("expected 2 attempts, got %d", attempts)
 	}
 }

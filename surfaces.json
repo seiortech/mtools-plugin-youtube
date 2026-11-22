@@ -90,8 +90,13 @@
                     {
                       "id": "net_row_3",
                       "layout": "horizontal",
-                      "fields": ["cookies_file"],
+                      "fields": ["cookies_file", "parallel_downloads"],
                       "actions": ["update_ytdlp"]
+                    },
+                    {
+                      "id": "net_row_4",
+                      "layout": "wrap",
+                      "fields": ["auto_retry", "continue_on_error"]
                     }
                   ]
                 }
@@ -328,7 +333,7 @@
           "kind": "select",
           "label": "Concurrent Fragments",
           "grow": true,
-          "default": "1",
+          "default": "4",
           "options": [
             { "label": "1 (Default)", "value": "1" },
             { "label": "2x", "value": "2" },
@@ -360,6 +365,34 @@
           "grow": true,
           "placeholder": "No cookies.txt selected",
           "default": ""
+        },
+        {
+          "id": "parallel_downloads",
+          "kind": "select",
+          "label": "Parallel Playlist Items",
+          "grow": true,
+          "default": "1",
+          "options": [
+            { "label": "1 (Sequential)", "value": "1" },
+            { "label": "2x", "value": "2" },
+            { "label": "3x", "value": "3" }
+          ]
+        },
+        {
+          "id": "auto_retry",
+          "kind": "toggle",
+          "label": "Auto Retry",
+          "hide_label": true,
+          "style": "chip",
+          "default": "true"
+        },
+        {
+          "id": "continue_on_error",
+          "kind": "toggle",
+          "label": "Continue Playlist on Error",
+          "hide_label": true,
+          "style": "chip",
+          "default": "true"
         }
       ],
       "actions": [
@@ -367,7 +400,7 @@
           "id": "preview",
           "label": "Preview",
           "kind": "inspect",
-          "inputs": ["url"]
+          "inputs": ["url", "cookies_browser", "cookies_file", "proxy_url"]
         },
         {
           "id": "download",
@@ -397,7 +430,10 @@
             "concurrent_fragments",
             "proxy_url",
             "rate_limit",
-            "cookies_file"
+            "cookies_file",
+            "parallel_downloads",
+            "auto_retry",
+            "continue_on_error"
           ]
         },
         {

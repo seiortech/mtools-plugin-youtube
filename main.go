@@ -8,27 +8,155 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/seiortech/mtools-plugin-youtube/internal/youtube"
 	"github.com/seiortech/mtools-sdk/pluginapi"
 )
 
-type ytServer struct{}
+const (
+	binaryCacheTTL   = 5 * time.Second
+	metadataCacheTTL = 5 * time.Minute
+	maxMetadataCache = 32
+)
 
-func resolveYTBinary(settings map[string]string) (string, error) {
+type cachedBinary struct {
+	key       string
+	path      string
+	err       error
+	expiresAt time.Time
+}
+
+type cachedMetadataEntry struct {
+	video     *youtube.VideoMetadata
+	playlist  *youtube.PlaylistMetadata
+	expiresAt time.Time
+}
+
+type ytServer struct {
+	mu          sync.Mutex
+	ytBinCache  cachedBinary
+	ffBinCache  cachedBinary
+	metaCache   map[string]cachedMetadataEntry
+	metaOrder   []string
+}
+
+func newYTServer() *ytServer {
+	return &ytServer{
+		metaCache: make(map[string]cachedMetadataEntry),
+	}
+}
+
+func (s *ytServer) invalidateBinaryCache() {
+	s.mu.Lock()
+	s.ytBinCache = cachedBinary{}
+	s.ffBinCache = cachedBinary{}
+	s.mu.Unlock()
+}
+
+func (s *ytServer) resolveYTBinary(settings map[string]string) (string, error) {
 	bin := settings["binary_path"]
 	if bin == "" {
 		bin = settings["helper_yt-dlp"]
 	}
-	return youtube.ResolveBinary(bin, settings["plugin_data_dir"])
+	dataDir := settings["plugin_data_dir"]
+	sharedDir := settings[pluginapi.SettingSharedToolsDir]
+	key := bin + "\x00" + dataDir + "\x00" + sharedDir
+
+	s.mu.Lock()
+	if s.ytBinCache.key == key && time.Now().Before(s.ytBinCache.expiresAt) {
+		p, err := s.ytBinCache.path, s.ytBinCache.err
+		s.mu.Unlock()
+		return p, err
+	}
+	s.mu.Unlock()
+
+	var p string
+	var err error
+	if resolved, ok := pluginapi.NewSharedTools(settings).Resolve(bin, pluginapi.SharedToolSpec{
+		FileName:     "yt-dlp",
+		IsExecutable: true,
+		CheckPATH:    true,
+	}); ok {
+		p = resolved
+	} else {
+		p, err = youtube.ResolveBinary(bin, dataDir)
+	}
+
+	s.mu.Lock()
+	s.ytBinCache = cachedBinary{key: key, path: p, err: err, expiresAt: time.Now().Add(binaryCacheTTL)}
+	s.mu.Unlock()
+	return p, err
 }
 
-func resolveFFmpegBinary(settings map[string]string) (string, error) {
+func (s *ytServer) resolveFFmpegBinary(settings map[string]string) (string, error) {
 	bin := settings["ffmpeg_path"]
 	if bin == "" {
 		bin = settings["helper_ffmpeg"]
 	}
-	return youtube.ResolveFFmpeg(bin, settings["plugin_data_dir"])
+	dataDir := settings["plugin_data_dir"]
+	sharedDir := settings[pluginapi.SettingSharedToolsDir]
+	key := bin + "\x00" + dataDir + "\x00" + sharedDir
+
+	s.mu.Lock()
+	if s.ffBinCache.key == key && time.Now().Before(s.ffBinCache.expiresAt) {
+		p, err := s.ffBinCache.path, s.ffBinCache.err
+		s.mu.Unlock()
+		return p, err
+	}
+	s.mu.Unlock()
+
+	var p string
+	var err error
+	if resolved, ok := pluginapi.NewSharedTools(settings).Resolve(bin, pluginapi.SharedToolSpec{
+		FileName:     "ffmpeg",
+		IsExecutable: true,
+		CheckPATH:    true,
+	}); ok {
+		p = resolved
+	} else {
+		p, err = youtube.ResolveFFmpeg(bin, dataDir)
+	}
+
+	s.mu.Lock()
+	s.ffBinCache = cachedBinary{key: key, path: p, err: err, expiresAt: time.Now().Add(binaryCacheTTL)}
+	s.mu.Unlock()
+	return p, err
+}
+
+func (s *ytServer) getCachedMetadata(key string) (cachedMetadataEntry, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.metaCache == nil {
+		return cachedMetadataEntry{}, false
+	}
+	entry, ok := s.metaCache[key]
+	if !ok || time.Now().After(entry.expiresAt) {
+		if ok {
+			delete(s.metaCache, key)
+		}
+		return cachedMetadataEntry{}, false
+	}
+	return entry, true
+}
+
+func (s *ytServer) setCachedMetadata(key string, entry cachedMetadataEntry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.metaCache == nil {
+		s.metaCache = make(map[string]cachedMetadataEntry)
+	}
+	if _, exists := s.metaCache[key]; !exists {
+		if len(s.metaOrder) >= maxMetadataCache {
+			evict := s.metaOrder[0]
+			s.metaOrder = s.metaOrder[1:]
+			delete(s.metaCache, evict)
+		}
+		s.metaOrder = append(s.metaOrder, key)
+	}
+	entry.expiresAt = time.Now().Add(metadataCacheTTL)
+	s.metaCache[key] = entry
 }
 
 func firstInput(inputs map[string][]string, key string) string {
@@ -51,11 +179,45 @@ func formatViews(views int64) string {
 	}
 }
 
+func metadataOptionsFromInputs(inputs map[string][]string, settings map[string]string) youtube.MetadataOptions {
+	cookiesBrowser := firstInput(inputs, "cookies_browser")
+	if cookiesBrowser == "" {
+		cookiesBrowser = settings["cookies_from_browser"]
+	}
+	if cookiesBrowser == "none" {
+		cookiesBrowser = ""
+	}
+	proxyURL := firstInput(inputs, "proxy_url")
+	if proxyURL == "" {
+		proxyURL = settings["proxy_url"]
+	}
+	return youtube.MetadataOptions{
+		CookiesFromBrowser: cookiesBrowser,
+		CookiesFile:        firstInput(inputs, "cookies_file"),
+		ProxyURL:           proxyURL,
+	}
+}
+
 func commandOptionsFromParams(p pluginapi.RunParams, bin, ffmpegBin, validURL, outDir string) youtube.CommandOptions {
 	outputFormat := firstInput(p.Inputs, "output_format")
 	if outputFormat == "" {
 		outputFormat = firstInput(p.Inputs, "format")
 	}
+	videoStream := firstInput(p.Inputs, "video_stream")
+	if videoStream == "" || videoStream == "bestvideo" {
+		switch p.Settings["quality"] {
+		case "1080":
+			videoStream = "bestvideo[height<=1080]"
+		case "720":
+			videoStream = "bestvideo[height<=720]"
+		case "audio":
+			videoStream = "none"
+			if outputFormat == "" || outputFormat == "mp4" {
+				outputFormat = "mp3"
+			}
+		}
+	}
+
 	filenameTemplate := firstInput(p.Inputs, "filename_template")
 	if filenameTemplate == "" {
 		filenameTemplate = firstInput(p.Inputs, "custom_filename")
@@ -66,17 +228,7 @@ func commandOptionsFromParams(p pluginapi.RunParams, bin, ffmpegBin, validURL, o
 	} else if v := firstInput(p.Inputs, "embed_subs"); v != "" {
 		embedSubs = v == "true"
 	}
-	cookiesBrowser := firstInput(p.Inputs, "cookies_browser")
-	if cookiesBrowser == "" {
-		cookiesBrowser = p.Settings["cookies_from_browser"]
-	}
-	if cookiesBrowser == "none" {
-		cookiesBrowser = ""
-	}
-	proxyURL := firstInput(p.Inputs, "proxy_url")
-	if proxyURL == "" {
-		proxyURL = p.Settings["proxy_url"]
-	}
+	metaOpts := metadataOptionsFromInputs(p.Inputs, p.Settings)
 	rateLimit := firstInput(p.Inputs, "rate_limit")
 	if rateLimit == "" {
 		rateLimit = p.Settings["rate_limit"]
@@ -108,7 +260,7 @@ func commandOptionsFromParams(p pluginapi.RunParams, bin, ffmpegBin, validURL, o
 		FFmpegPath:          ffmpegBin,
 		URL:                 validURL,
 		OutputDir:           outDir,
-		VideoStream:         firstInput(p.Inputs, "video_stream"),
+		VideoStream:         videoStream,
 		AudioStream:         firstInput(p.Inputs, "audio_stream"),
 		OutputFormat:        outputFormat,
 		AudioQuality:        firstInput(p.Inputs, "audio_quality"),
@@ -123,9 +275,9 @@ func commandOptionsFromParams(p pluginapi.RunParams, bin, ffmpegBin, validURL, o
 		TimeRangeStart:      firstInput(p.Inputs, "time_start"),
 		TimeRangeEnd:        firstInput(p.Inputs, "time_end"),
 		ForceKeyframesCuts:  firstInput(p.Inputs, "force_keyframes_cuts") == "true",
-		CookiesFromBrowser:  cookiesBrowser,
-		CookiesFile:         firstInput(p.Inputs, "cookies_file"),
-		ProxyURL:            proxyURL,
+		CookiesFromBrowser:  metaOpts.CookiesFromBrowser,
+		CookiesFile:         metaOpts.CookiesFile,
+		ProxyURL:            metaOpts.ProxyURL,
 		RateLimit:           rateLimit,
 		ConcurrentFragments: frags,
 		CustomFilename:      filenameTemplate,
@@ -140,7 +292,7 @@ func (s *ytServer) Inspect(ctx context.Context, p pluginapi.InspectParams) (plug
 		HelperStatus: make(map[string]pluginapi.HelperStatus),
 	}
 
-	bin, err := resolveYTBinary(p.Settings)
+	bin, err := s.resolveYTBinary(p.Settings)
 	res.HelperStatus["yt-dlp"] = pluginapi.HelperStatus{
 		Found:   err == nil,
 		Needed:  true,
@@ -148,7 +300,7 @@ func (s *ytServer) Inspect(ctx context.Context, p pluginapi.InspectParams) (plug
 		Message: "yt-dlp binary is required to download videos",
 	}
 
-	ffmpegBin, ffmpegErr := resolveFFmpegBinary(p.Settings)
+	ffmpegBin, ffmpegErr := s.resolveFFmpegBinary(p.Settings)
 
 	outDir := p.Settings["download_dir"]
 	if outDir == "" {
@@ -190,14 +342,25 @@ func (s *ytServer) Inspect(ctx context.Context, p pluginapi.InspectParams) (plug
 			}
 		}
 
+		metaOpts := metadataOptionsFromInputs(p.Inputs, p.Settings)
+		cacheKey := validURL + "\x00" + metaOpts.CookiesFromBrowser + "\x00" + metaOpts.CookiesFile + "\x00" + metaOpts.ProxyURL
+
 		if youtube.IsPlaylistURL(validURL) {
-			appendLog(fmt.Sprintf("[cmd] %s --flat-playlist --dump-single-json %s", bin, validURL))
-			pm, pmErr := youtube.FetchPlaylistMetadataWithLogs(ctx, bin, validURL, appendLog)
-			if pmErr != nil {
-				res.Error = pmErr.Error()
-				return res, nil
+			var pm *youtube.PlaylistMetadata
+			if cached, ok := s.getCachedMetadata("pl:" + cacheKey); ok && cached.playlist != nil {
+				pm = cached.playlist
+				appendLog(fmt.Sprintf("[cache] Playlist loaded from cache: %s (%d items)", pm.Title, len(pm.Entries)))
+			} else {
+				appendLog(fmt.Sprintf("[cmd] %s --flat-playlist --dump-single-json -- %s", bin, validURL))
+				var pmErr error
+				pm, pmErr = youtube.FetchPlaylistMetadataWithOptions(ctx, bin, validURL, metaOpts, appendLog)
+				if pmErr != nil {
+					res.Error = pmErr.Error()
+					return res, nil
+				}
+				s.setCachedMetadata("pl:"+cacheKey, cachedMetadataEntry{playlist: pm})
+				appendLog(fmt.Sprintf("Playlist loaded: %s (%d items)", pm.Title, len(pm.Entries)))
 			}
-			appendLog(fmt.Sprintf("Playlist loaded: %s (%d items)", pm.Title, len(pm.Entries)))
 			res.IsPlaylist = true
 			res.Preview = &pluginapi.InspectPreview{
 				Title:       pm.Title,
@@ -215,13 +378,21 @@ func (s *ytServer) Inspect(ctx context.Context, p pluginapi.InspectParams) (plug
 			}
 			res.Fields["playlist_items"] = pluginapi.InspectFieldUpdate{Options: items}
 		} else {
-			appendLog(fmt.Sprintf("[cmd] %s --dump-single-json --no-playlist %s", bin, validURL))
-			meta, metaErr := youtube.FetchMetadataWithLogs(ctx, bin, validURL, appendLog)
-			if metaErr != nil {
-				res.Error = metaErr.Error()
-				return res, nil
+			var meta *youtube.VideoMetadata
+			if cached, ok := s.getCachedMetadata("vid:" + cacheKey); ok && cached.video != nil {
+				meta = cached.video
+				appendLog(fmt.Sprintf("[cache] Metadata loaded from cache: %s", meta.Title))
+			} else {
+				appendLog(fmt.Sprintf("[cmd] %s --dump-single-json --no-playlist -- %s", bin, validURL))
+				var metaErr error
+				meta, metaErr = youtube.FetchMetadataWithOptions(ctx, bin, validURL, metaOpts, appendLog)
+				if metaErr != nil {
+					res.Error = metaErr.Error()
+					return res, nil
+				}
+				s.setCachedMetadata("vid:"+cacheKey, cachedMetadataEntry{video: meta})
+				appendLog(fmt.Sprintf("Metadata ready: %s", meta.Title))
 			}
-			appendLog(fmt.Sprintf("Metadata ready: %s", meta.Title))
 			var metaParts []string
 			if meta.DurationString != "" {
 				metaParts = append(metaParts, meta.DurationString)
@@ -268,13 +439,21 @@ func (s *ytServer) Run(ctx context.Context, p pluginapi.RunParams, emit func(plu
 
 	switch p.Action {
 	case "fetch_ytdlp":
-		return runBinaryDownload(ctx, p, youtube.BinaryName(), "yt-dlp", "Connecting to GitHub releases...", youtube.DownloadBinaryTo, emit)
+		res, err := runBinaryDownload(ctx, p, youtube.BinaryName(), "yt-dlp", "Connecting to GitHub releases...", youtube.DownloadBinaryTo, emit)
+		if err == nil {
+			s.invalidateBinaryCache()
+		}
+		return res, err
 
 	case "fetch_ffmpeg":
-		return runBinaryDownload(ctx, p, youtube.FFmpegBinaryName(), "ffmpeg", "Connecting to ffmpeg release...", youtube.DownloadFFmpegTo, emit)
+		res, err := runBinaryDownload(ctx, p, youtube.FFmpegBinaryName(), "ffmpeg", "Connecting to ffmpeg release...", youtube.DownloadFFmpegTo, emit)
+		if err == nil {
+			s.invalidateBinaryCache()
+		}
+		return res, err
 
 	case "update_ytdlp":
-		bin, err := resolveYTBinary(p.Settings)
+		bin, err := s.resolveYTBinary(p.Settings)
 		if err != nil {
 			return pluginapi.RunResult{}, err
 		}
@@ -309,11 +488,11 @@ func (s *ytServer) Run(ctx context.Context, p pluginapi.RunParams, emit func(plu
 			return pluginapi.RunResult{}, err
 		}
 
-		bin, err := resolveYTBinary(p.Settings)
+		bin, err := s.resolveYTBinary(p.Settings)
 		if err != nil {
 			return pluginapi.RunResult{}, err
 		}
-		ffmpegBin, _ := resolveFFmpegBinary(p.Settings)
+		ffmpegBin, _ := s.resolveFFmpegBinary(p.Settings)
 
 		outDir := p.Settings["download_dir"]
 		if d := firstInput(p.Inputs, "output_dir"); d != "" {
@@ -331,70 +510,194 @@ func (s *ytServer) Run(ctx context.Context, p pluginapi.RunParams, emit func(plu
 			isPlaylist = true
 		}
 
-		var allOutputs []string
-		var summaries []string
-		for idx, targetURL := range targets {
-			downloadJob := youtube.DownloadJob{
-				URL:                 targetURL,
-				BinaryPath:          bin,
-				FFmpegPath:          ffmpegBin,
-				OutputDir:           outDir,
-				VideoStream:         opts.VideoStream,
-				AudioStream:         opts.AudioStream,
-				OutputFormat:        opts.OutputFormat,
-				AudioQuality:        opts.AudioQuality,
-				EmbedSubs:           opts.EmbedSubs,
-				SubLangs:            opts.SubLangs,
-				WriteAutoSubs:       opts.WriteAutoSubs,
-				EmbedThumbnail:      opts.EmbedThumbnail,
-				EmbedChapters:       opts.EmbedChapters,
-				EmbedMetadata:       opts.EmbedMetadata,
-				SponsorBlockMode:    opts.SponsorBlockMode,
-				SponsorBlockCats:    opts.SponsorBlockCats,
-				TimeRangeStart:      opts.TimeRangeStart,
-				TimeRangeEnd:        opts.TimeRangeEnd,
-				ForceKeyframesCuts:  opts.ForceKeyframesCuts,
-				CookiesFromBrowser:  opts.CookiesFromBrowser,
-				CookiesFile:         opts.CookiesFile,
-				ProxyURL:            opts.ProxyURL,
-				RateLimit:           opts.RateLimit,
-				ConcurrentFragments: opts.ConcurrentFragments,
-				CustomFilename:      opts.CustomFilename,
-				IsPlaylistItem:      isPlaylist || opts.IsPlaylistItem,
+		retryPolicy := youtube.DefaultRetryPolicy()
+		if firstInput(p.Inputs, "auto_retry") == "false" {
+			retryPolicy.MaxAttempts = 1
+		}
+		continueOnError := firstInput(p.Inputs, "continue_on_error") != "false"
+		workers := 1
+		if w, err := strconv.Atoi(firstInput(p.Inputs, "parallel_downloads")); err == nil && w > 1 {
+			if w > 3 {
+				w = 3
 			}
-
-			res, err := downloadJob.Run(ctx, func(pr pluginapi.Progress) {
-				msg := pr.Message
-				if len(targets) > 1 {
-					msg = fmt.Sprintf("[%d/%d] %s", idx+1, len(targets), pr.Message)
-				}
-				_ = emit(pluginapi.Progress{
-					JobID:   p.JobID,
-					Done:    pr.Done,
-					Total:   pr.Total,
-					Unit:    pr.Unit,
-					Message: msg,
-					LogLine: pr.LogLine,
-				})
-			})
-			if err != nil {
-				return pluginapi.RunResult{}, err
-			}
-			allOutputs = append(allOutputs, res.Outputs...)
-			if res.Summary != "" {
-				summaries = append(summaries, res.Summary)
-			}
+			workers = w
 		}
 
-		return pluginapi.RunResult{
-			JobID:   p.JobID,
-			Outputs: allOutputs,
-			Summary: strings.Join(summaries, "\n"),
-		}, nil
+		return runBatchDownloads(ctx, p.JobID, targets, isPlaylist, opts, retryPolicy, continueOnError, workers, emit)
 
 	default:
 		return pluginapi.RunResult{}, errors.New("unknown action")
 	}
+}
+
+func runBatchDownloads(
+	ctx context.Context,
+	jobID string,
+	targets []string,
+	isPlaylist bool,
+	baseOpts youtube.CommandOptions,
+	retryPolicy youtube.RetryPolicy,
+	continueOnError bool,
+	workers int,
+	emit func(pluginapi.Progress) error,
+) (pluginapi.RunResult, error) {
+	total := len(targets)
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > total {
+		workers = total
+	}
+
+	type itemResult struct {
+		outputs []string
+		summary string
+		err     error
+	}
+
+	results := make([]itemResult, total)
+	itemPcts := make([]float64, total)
+
+	var mu sync.Mutex
+	var emitMu sync.Mutex
+	safeEmit := func(pr pluginapi.Progress) {
+		emitMu.Lock()
+		_ = emit(pr)
+		emitMu.Unlock()
+	}
+
+	completed := 0
+	var firstErr error
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+
+	for idx, targetURL := range targets {
+		if runCtx.Err() != nil {
+			break
+		}
+
+		wg.Add(1)
+		go func(idx int, targetURL string) {
+			defer wg.Done()
+
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-runCtx.Done():
+				results[idx] = itemResult{err: context.Canceled}
+				return
+			}
+
+			jobOpts := baseOpts
+			jobOpts.URL = targetURL
+			jobOpts.IsPlaylistItem = isPlaylist || baseOpts.IsPlaylistItem
+			dlJob := youtube.DownloadJob{CommandOptions: jobOpts}
+
+			res, err := dlJob.RunWithRetry(runCtx, retryPolicy, func(pr pluginapi.Progress) {
+				mu.Lock()
+				if pr.Done > itemPcts[idx] {
+					itemPcts[idx] = pr.Done
+				}
+				var sumPct float64
+				for _, pct := range itemPcts {
+					sumPct += pct
+				}
+				overallPct := sumPct / float64(total)
+				msg := pr.Message
+				logLine := pr.LogLine
+				if total > 1 {
+					msg = fmt.Sprintf("[%d/%d] %s", idx+1, total, pr.Message)
+					if logLine != "" {
+						logLine = fmt.Sprintf("[#%d] %s", idx+1, logLine)
+					}
+				}
+				mu.Unlock()
+
+				safeEmit(pluginapi.Progress{
+					JobID:   jobID,
+					Done:    overallPct,
+					Total:   100,
+					Unit:    "%",
+					Message: msg,
+					LogLine: logLine,
+				})
+			})
+
+			var skipEmit *pluginapi.Progress
+			mu.Lock()
+			completed++
+			itemPcts[idx] = 100
+			if err != nil {
+				results[idx] = itemResult{err: err}
+				if firstErr == nil {
+					firstErr = err
+				}
+				if total > 1 && continueOnError && !errors.Is(err, context.Canceled) {
+					skipEmit = &pluginapi.Progress{
+						JobID:   jobID,
+						Done:    float64(completed) / float64(total) * 100,
+						Total:   100,
+						Unit:    "%",
+						Message: fmt.Sprintf("[%d/%d] Skipped (%v) — continuing...", idx+1, total, err),
+						LogLine: fmt.Sprintf("[#%d] ERROR: %v (skipping and continuing batch)", idx+1, err),
+					}
+				} else if !continueOnError || errors.Is(err, context.Canceled) {
+					cancel()
+				}
+			} else {
+				results[idx] = itemResult{outputs: res.Outputs, summary: res.Summary}
+			}
+			mu.Unlock()
+
+			if skipEmit != nil {
+				safeEmit(*skipEmit)
+			}
+		}(idx, targetURL)
+	}
+
+	wg.Wait()
+
+	if ctx.Err() != nil {
+		return pluginapi.RunResult{}, context.Canceled
+	}
+
+	var allOutputs []string
+	var summaries []string
+	var failedCount int
+	var lastItemErr error
+	for _, r := range results {
+		if r.err != nil {
+			failedCount++
+			lastItemErr = r.err
+			continue
+		}
+		allOutputs = append(allOutputs, r.outputs...)
+		if r.summary != "" {
+			summaries = append(summaries, r.summary)
+		}
+	}
+
+	if failedCount > 0 && len(allOutputs) == 0 {
+		if lastItemErr != nil {
+			return pluginapi.RunResult{}, lastItemErr
+		}
+		return pluginapi.RunResult{}, firstErr
+	}
+
+	summary := strings.Join(summaries, "\n")
+	if total > 1 && failedCount > 0 {
+		summary = fmt.Sprintf("Downloaded %d/%d items (%d failed)\n%s", total-failedCount, total, failedCount, summary)
+	}
+
+	return pluginapi.RunResult{
+		JobID:   jobID,
+		Outputs: allOutputs,
+		Summary: summary,
+	}, nil
 }
 
 func runBinaryDownload(
@@ -404,11 +707,16 @@ func runBinaryDownload(
 	downloadFn func(context.Context, string, func(pluginapi.Progress)) (string, error),
 	emit func(pluginapi.Progress) error,
 ) (pluginapi.RunResult, error) {
-	outDirs := p.Inputs["output_dir"]
-	if len(outDirs) == 0 || outDirs[0] == "" {
+	outDir := ""
+	if outDirs := p.Inputs["output_dir"]; len(outDirs) > 0 && outDirs[0] != "" {
+		outDir = outDirs[0]
+	} else if sd := p.SharedToolsDir(); sd != "" {
+		outDir = sd
+	}
+	if outDir == "" {
 		return pluginapi.RunResult{}, errors.New("missing destination directory")
 	}
-	target := filepath.Join(outDirs[0], binName)
+	target := filepath.Join(outDir, binName)
 	_ = emit(pluginapi.Progress{
 		JobID:   p.JobID,
 		Done:    10,
@@ -451,7 +759,7 @@ func main() {
 		PluginID: "com.mtools.youtube",
 		Version:  "1.0.0",
 	}
-	server := &ytServer{}
+	server := newYTServer()
 	if err := pluginapi.Serve(context.Background(), os.Stdin, os.Stdout, identity, server); err != nil {
 		os.Exit(1)
 	}

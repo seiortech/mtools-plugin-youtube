@@ -48,6 +48,9 @@
     "fields.rate_limit.placeholder": "e.g. 5M or 500K",
     "fields.cookies_file.label": "Cookies File",
     "fields.cookies_file.placeholder": "No cookies.txt selected",
+    "fields.parallel_downloads.label": "Parallel Playlist Items",
+    "fields.auto_retry.label": "Auto Retry",
+    "fields.continue_on_error.label": "Continue Playlist on Error",
 
     "options.video_stream.bestvideo": "Auto (Best Video)",
     "options.video_stream.bestvideo[height<=1080]": "1080p (Full HD)",
@@ -70,6 +73,7 @@
     "options.sponsorblock_mode.mark": "Mark Chapters",
     "options.cookies_browser.none": "None",
     "options.concurrent_fragments.1": "1 (Default)",
+    "options.parallel_downloads.1": "1 (Sequential)",
     "options.quality.best": "Best available",
     "options.quality.1080": "1080p",
     "options.quality.720": "720p",

@@ -9,12 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -25,7 +25,7 @@ import (
 )
 
 var (
-	ErrInvalidURL          = errors.New("invalid YouTube URL: must be http(s)://(www.)youtube.com or youtu.be")
+	ErrInvalidURL          = errors.New("invalid URL: must be a valid http(s):// link")
 	ErrMissingBinary       = errors.New("yt-dlp binary not found: configure path or download binary")
 	ErrMissingFFmpeg       = errors.New("ffmpeg binary not found: required for merging, clipping, audio conversion, or embedding")
 	ErrInvalidTimeRange    = errors.New("invalid time range: use HH:MM:SS, MM:SS, or seconds, with start < end")
@@ -36,71 +36,87 @@ var (
 )
 
 var (
-	customProgressRegex   = regexp.MustCompile(`^\s*([\d\.]+)%\s*\|\s*([^|]*)\|\s*([^\s]*)`)
-	fallbackProgressRegex = regexp.MustCompile(`\[download\]\s+([\d\.]+)%`)
-	rateLimitRegex        = regexp.MustCompile(`^\d+(\.\d+)?[KMGkmg]?$`)
-	lookPath              = exec.LookPath
+	lookPath   = exec.LookPath
+	httpClient = &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   15 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   15 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			IdleConnTimeout:       60 * time.Second,
+		},
+	}
 )
 
-// ParseURL validates that raw URL is a valid HTTP(S) link to YouTube.
+// ParseURL validates that raw is a valid HTTP(S) URL with a non-empty host.
 func ParseURL(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
-	if raw == "" {
+	if raw == "" || strings.HasPrefix(raw, "-") {
 		return "", ErrInvalidURL
 	}
 
 	u, err := url.Parse(raw)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
-		return "", ErrInvalidURL
-	}
-
-	host := strings.ToLower(u.Host)
-	host, _ = strings.CutPrefix(host, "www.")
-
-	if host != "youtube.com" && host != "m.youtube.com" && host != "youtu.be" {
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return "", ErrInvalidURL
 	}
 
 	return raw, nil
 }
 
-// ParseProgressLine extracts progress metrics from a yt-dlp stdout line.
+// ParseProgressLine extracts progress metrics from a yt-dlp stdout line without regexp overhead.
 func ParseProgressLine(line string) (pluginapi.Progress, bool) {
 	line = strings.TrimSpace(line)
 	if line == "" {
 		return pluginapi.Progress{}, false
 	}
 
-	if m := customProgressRegex.FindStringSubmatch(line); len(m) == 4 {
-		pct, _ := strconv.ParseFloat(m[1], 64)
-		speed := strings.TrimSpace(m[2])
-		eta := strings.TrimSpace(m[3])
-
-		msg := speed
-		if eta != "" {
-			if msg != "" {
-				msg += " · ETA " + eta
-			} else {
-				msg = "ETA " + eta
+	// Custom template format: "<pct>%|<speed>|<eta>"
+	if pctIdx := strings.IndexByte(line, '%'); pctIdx > 0 {
+		rest := line[pctIdx+1:]
+		if p1 := strings.IndexByte(rest, '|'); p1 >= 0 {
+			afterP1 := rest[p1+1:]
+			if p2 := strings.IndexByte(afterP1, '|'); p2 >= 0 {
+				if pct, err := strconv.ParseFloat(strings.TrimSpace(line[:pctIdx]), 64); err == nil {
+					speed := strings.TrimSpace(afterP1[:p2])
+					eta := strings.TrimSpace(afterP1[p2+1:])
+					if sp := strings.IndexAny(eta, " \t"); sp >= 0 {
+						eta = eta[:sp]
+					}
+					msg := speed
+					if eta != "" {
+						if msg != "" {
+							msg += " · ETA " + eta
+						} else {
+							msg = "ETA " + eta
+						}
+					}
+					return pluginapi.Progress{
+						Done:    pct,
+						Total:   100,
+						Unit:    "%",
+						Message: msg,
+					}, true
+				}
 			}
 		}
-
-		return pluginapi.Progress{
-			Done:    pct,
-			Total:   100,
-			Unit:    "%",
-			Message: msg,
-		}, true
 	}
 
-	if m := fallbackProgressRegex.FindStringSubmatch(line); len(m) == 2 {
-		pct, _ := strconv.ParseFloat(m[1], 64)
-		return pluginapi.Progress{
-			Done:    pct,
-			Total:   100,
-			Unit:    "%",
-			Message: line,
-		}, true
+	// Fallback yt-dlp format: "[download]  75.0% of ..."
+	if after, ok := strings.CutPrefix(line, "[download]"); ok {
+		after = strings.TrimSpace(after)
+		if pctIdx := strings.IndexByte(after, '%'); pctIdx > 0 {
+			if pct, err := strconv.ParseFloat(strings.TrimSpace(after[:pctIdx]), 64); err == nil {
+				return pluginapi.Progress{
+					Done:    pct,
+					Total:   100,
+					Unit:    "%",
+					Message: line,
+				}, true
+			}
+		}
 	}
 
 	return pluginapi.Progress{}, false
@@ -122,11 +138,7 @@ func FFmpegBinaryName() string {
 	return "ffmpeg"
 }
 
-// ResolveFFmpeg locates ffmpeg executable in priority order:
-// 1. Explicit path
-// 2. Plugin data directory (root or bin/ subdir)
-// 3. System PATH
-func ResolveFFmpeg(customPath, pluginDataDir string) (string, error) {
+func resolveExecutable(binName, lookName, customPath, pluginDataDir string, notFoundErr error) (string, error) {
 	if customPath != "" {
 		if fi, err := os.Stat(customPath); err == nil && !fi.IsDir() {
 			return customPath, nil
@@ -134,21 +146,29 @@ func ResolveFFmpeg(customPath, pluginDataDir string) (string, error) {
 	}
 
 	if pluginDataDir != "" {
-		managedRoot := filepath.Join(pluginDataDir, FFmpegBinaryName())
+		managedRoot := filepath.Join(pluginDataDir, binName)
 		if fi, err := os.Stat(managedRoot); err == nil && !fi.IsDir() {
 			return managedRoot, nil
 		}
-		managedBin := filepath.Join(pluginDataDir, "bin", FFmpegBinaryName())
+		managedBin := filepath.Join(pluginDataDir, "bin", binName)
 		if fi, err := os.Stat(managedBin); err == nil && !fi.IsDir() {
 			return managedBin, nil
 		}
 	}
 
-	if path, err := lookPath("ffmpeg"); err == nil {
+	if path, err := lookPath(lookName); err == nil {
 		return path, nil
 	}
 
-	return "", ErrMissingFFmpeg
+	return "", notFoundErr
+}
+
+// ResolveFFmpeg locates ffmpeg executable in priority order:
+// 1. Explicit path
+// 2. Plugin data directory (root or bin/ subdir)
+// 3. System PATH
+func ResolveFFmpeg(customPath, pluginDataDir string) (string, error) {
+	return resolveExecutable(FFmpegBinaryName(), "ffmpeg", customPath, pluginDataDir, ErrMissingFFmpeg)
 }
 
 // ResolveBinary locates yt-dlp executable in priority order:
@@ -156,39 +176,18 @@ func ResolveFFmpeg(customPath, pluginDataDir string) (string, error) {
 // 2. Plugin data directory (root or bin/ subdir)
 // 3. System PATH
 func ResolveBinary(customPath, pluginDataDir string) (string, error) {
-	if customPath != "" {
-		if fi, err := os.Stat(customPath); err == nil && !fi.IsDir() {
-			return customPath, nil
-		}
-	}
-
-	if pluginDataDir != "" {
-		// Priority 2a: directly in plugin data directory (same as history.json)
-		managedRoot := filepath.Join(pluginDataDir, BinaryName())
-		if fi, err := os.Stat(managedRoot); err == nil && !fi.IsDir() {
-			return managedRoot, nil
-		}
-
-		// Priority 2b: bin subdirectory
-		managedBin := filepath.Join(pluginDataDir, "bin", BinaryName())
-		if fi, err := os.Stat(managedBin); err == nil && !fi.IsDir() {
-			return managedBin, nil
-		}
-	}
-
-	if path, err := lookPath("yt-dlp"); err == nil {
-		return path, nil
-	}
-
-	return "", ErrMissingBinary
+	return resolveExecutable(BinaryName(), "yt-dlp", customPath, pluginDataDir, ErrMissingBinary)
 }
 
-// ReleaseAssetURL returns official standalone GitHub release download URL for current OS.
+// ReleaseAssetURL returns official standalone GitHub release download URL for current OS and arch.
 func ReleaseAssetURL() (string, error) {
 	switch runtime.GOOS {
 	case "darwin":
 		return "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos", nil
 	case "linux":
+		if runtime.GOARCH == "arm64" {
+			return "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux_aarch64", nil
+		}
 		return "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux", nil
 	case "windows":
 		return "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe", nil
@@ -261,7 +260,7 @@ func DownloadFFmpegTo(ctx context.Context, targetPath string, progress func(plug
 
 // DownloadFFmpegFromURLTo downloads a .zip archive from assetURL and atomically installs the ffmpeg binary to targetPath.
 func DownloadFFmpegFromURLTo(ctx context.Context, assetURL, targetPath string, progress func(pluginapi.Progress)) (string, error) {
-	return downloadFFmpegFromURLWithClient(ctx, http.DefaultClient, assetURL, targetPath, progress)
+	return downloadFFmpegFromURLWithClient(ctx, httpClient, assetURL, targetPath, progress)
 }
 
 func downloadFFmpegFromURLWithClient(ctx context.Context, client *http.Client, assetURL, targetPath string, progress func(pluginapi.Progress)) (string, error) {
@@ -395,13 +394,66 @@ func extractFFmpegFromZip(ctx context.Context, zipPath, targetPath string) error
 }
 
 func downloadURLToTempFile(ctx context.Context, assetURL, tempPath string, mode os.FileMode, progress func(pluginapi.Progress)) error {
-	return downloadURLToTempFileWithClient(ctx, http.DefaultClient, assetURL, tempPath, mode, progress)
+	return downloadURLToTempFileWithClient(ctx, httpClient, assetURL, tempPath, mode, progress)
 }
 
 func downloadURLToTempFileWithClient(ctx context.Context, client *http.Client, assetURL, tempPath string, mode os.FileMode, progress func(pluginapi.Progress)) error {
+	const maxAttempts = 3
+	var lastErr error
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			_ = os.Remove(tempPath)
+			return ctx.Err()
+		}
+
+		var offset int64
+		if fi, err := os.Stat(tempPath); err == nil && fi.Size() > 0 {
+			offset = fi.Size()
+		}
+
+		err := downloadURLAttempt(ctx, client, assetURL, tempPath, mode, offset, progress)
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			_ = os.Remove(tempPath)
+			return err
+		}
+		lastErr = err
+
+		if attempt+1 < maxAttempts {
+			delay := time.Duration(1<<attempt) * time.Second
+			if progress != nil {
+				progress(pluginapi.Progress{
+					Done:    0,
+					Total:   100,
+					Unit:    "%",
+					Message: fmt.Sprintf("Download interrupted — resuming in %s (attempt %d/%d)...", delay, attempt+2, maxAttempts),
+				})
+			}
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				_ = os.Remove(tempPath)
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+
+	_ = os.Remove(tempPath)
+	return lastErr
+}
+
+func downloadURLAttempt(ctx context.Context, client *http.Client, assetURL, tempPath string, mode os.FileMode, offset int64, progress func(pluginapi.Progress)) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, assetURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create download request: %w", err)
+	}
+	if offset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 	}
 
 	resp, err := client.Do(req)
@@ -410,24 +462,41 @@ func downloadURLToTempFileWithClient(ctx context.Context, client *http.Client, a
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	flags := os.O_WRONLY | os.O_CREATE
+	var total int64
+	var downloaded int64
+
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		flags |= os.O_APPEND
+		downloaded = offset
+		if resp.ContentLength > 0 {
+			total = offset + resp.ContentLength
+		}
+	case http.StatusOK:
+		flags |= os.O_TRUNC
+		downloaded = 0
+		total = resp.ContentLength
+	case http.StatusRequestedRangeNotSatisfiable:
+		// File already complete or range invalid; restart cleanly from 0.
+		_ = os.Remove(tempPath)
+		return fmt.Errorf("download server returned HTTP %d", resp.StatusCode)
+	default:
 		return fmt.Errorf("download server returned HTTP %d", resp.StatusCode)
 	}
 
-	f, err := os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	f, err := os.OpenFile(tempPath, flags, mode)
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %w", err)
 	}
 
-	total := float64(resp.ContentLength)
-	var downloaded int64
-	buf := make([]byte, 32*1024)
+	buf := make([]byte, 128*1024)
+	var lastEmit time.Time
 
 	for {
 		select {
 		case <-ctx.Done():
 			f.Close()
-			_ = os.Remove(tempPath)
 			return ctx.Err()
 		default:
 		}
@@ -436,16 +505,16 @@ func downloadURLToTempFileWithClient(ctx context.Context, client *http.Client, a
 		if n > 0 {
 			if _, wErr := f.Write(buf[:n]); wErr != nil {
 				f.Close()
-				_ = os.Remove(tempPath)
 				return fmt.Errorf("failed to write download: %w", wErr)
 			}
 			downloaded += int64(n)
-			if progress != nil && total > 0 {
+			if progress != nil && total > 0 && (time.Since(lastEmit) >= 100*time.Millisecond || downloaded >= total) {
+				lastEmit = time.Now()
 				progress(pluginapi.Progress{
-					Done:    float64(downloaded) / total * 100,
+					Done:    float64(downloaded) / float64(total) * 100,
 					Total:   100,
 					Unit:    "%",
-					Message: fmt.Sprintf("%.1f / %.1f MB", float64(downloaded)/1024/1024, total/1024/1024),
+					Message: fmt.Sprintf("%.1f / %.1f MB", float64(downloaded)/1024/1024, float64(total)/1024/1024),
 				})
 			}
 		}
@@ -455,29 +524,20 @@ func downloadURLToTempFileWithClient(ctx context.Context, client *http.Client, a
 				break
 			}
 			f.Close()
-			_ = os.Remove(tempPath)
 			return fmt.Errorf("error reading response stream: %w", rErr)
 		}
 	}
 
 	if err := f.Sync(); err != nil {
 		f.Close()
-		_ = os.Remove(tempPath)
 		return fmt.Errorf("failed to sync download: %w", err)
 	}
 
 	if err := f.Close(); err != nil {
-		_ = os.Remove(tempPath)
 		return fmt.Errorf("failed to close download: %w", err)
 	}
 
 	return nil
-}
-
-// DownloadBinary downloads the official yt-dlp standalone executable into plugin data dir (root).
-func DownloadBinary(ctx context.Context, pluginDataDir string, progress func(pluginapi.Progress)) (string, error) {
-	target := filepath.Join(pluginDataDir, BinaryName())
-	return DownloadBinaryTo(ctx, target, progress)
 }
 
 // VideoMetadata stores video attributes returned by yt-dlp.
@@ -608,7 +668,16 @@ func ParseRateLimit(raw string) (string, error) {
 	if s == "" {
 		return "", nil
 	}
-	if !rateLimitRegex.MatchString(s) {
+	check := s
+	switch check[len(check)-1] {
+	case 'K', 'M', 'G', 'k', 'm', 'g':
+		check = check[:len(check)-1]
+	}
+	if check == "" {
+		return "", ErrInvalidRateLimit
+	}
+	v, err := strconv.ParseFloat(check, 64)
+	if err != nil || v <= 0 {
 		return "", ErrInvalidRateLimit
 	}
 	return s, nil
@@ -711,6 +780,12 @@ func BuildArgs(opts CommandOptions) []string {
 		"--newline",
 		"--progress-template", "%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
 		"--no-playlist",
+		"--continue",
+		"--retries", "10",
+		"--fragment-retries", "10",
+		"--retry-sleep", "exp=1:30",
+		"--file-access-retries", "3",
+		"--socket-timeout", "30",
 	}
 
 	if opts.FFmpegPath != "" {
@@ -745,7 +820,8 @@ func BuildArgs(opts CommandOptions) []string {
 	}
 
 	switch {
-	case video == "none" && isAudioOnlyFormat(opts.OutputFormat):
+	case isAudioOnlyFormat(opts.OutputFormat):
+		// Always extract audio without downloading video when an audio-only container is selected.
 		args = append(args, "-x", "--audio-format", opts.OutputFormat)
 		if opts.AudioQuality != "" {
 			args = append(args, "--audio-quality", opts.AudioQuality)
@@ -764,7 +840,7 @@ func BuildArgs(opts CommandOptions) []string {
 		}
 	case video != "none" && audio == "none":
 		args = append(args, "-f", video)
-		if opts.OutputFormat != "" && !isAudioOnlyFormat(opts.OutputFormat) {
+		if opts.OutputFormat != "" {
 			args = append(args, "--remux-video", opts.OutputFormat)
 		}
 	default:
@@ -773,7 +849,7 @@ func BuildArgs(opts CommandOptions) []string {
 			formatSpec = "bestvideo+bestaudio/best"
 		}
 		args = append(args, "-f", formatSpec)
-		if opts.OutputFormat != "" && !isAudioOnlyFormat(opts.OutputFormat) {
+		if opts.OutputFormat != "" {
 			args = append(args, "--merge-output-format", opts.OutputFormat)
 		}
 	}
@@ -842,7 +918,7 @@ func BuildArgs(opts CommandOptions) []string {
 	}
 
 	if opts.URL != "" {
-		args = append(args, opts.URL)
+		args = append(args, "--", opts.URL)
 	}
 
 	return args
@@ -856,16 +932,21 @@ func BuildCommandString(opts CommandOptions) string {
 		bin = "yt-dlp"
 	}
 	args := BuildArgs(opts)
-	var parts []string
+	parts := make([]string, 0, len(args)+1)
 	parts = append(parts, quoteArg(bin))
+	skipNext := false
 	for _, arg := range args {
-		if arg == "--newline" {
+		if skipNext {
+			skipNext = false
 			continue
 		}
-		if strings.HasPrefix(arg, "%(progress.") {
+		switch arg {
+		case "--newline", "--continue":
 			continue
-		}
-		if arg == "--progress-template" {
+		case "--progress-template", "--retries", "--fragment-retries", "--retry-sleep", "--file-access-retries", "--socket-timeout":
+			skipNext = true
+			continue
+		case "--":
 			continue
 		}
 		parts = append(parts, quoteArg(arg))
@@ -881,6 +962,25 @@ func quoteArg(s string) string {
 }
 
 const maxStderrCapture = 64 * 1024
+
+// MetadataOptions carries optional auth/proxy settings for metadata preview commands.
+type MetadataOptions struct {
+	CookiesFromBrowser string
+	CookiesFile        string
+	ProxyURL           string
+}
+
+func appendMetadataOptions(args []string, opts MetadataOptions) []string {
+	if opts.CookiesFromBrowser != "" && opts.CookiesFromBrowser != "none" {
+		args = append(args, "--cookies-from-browser", opts.CookiesFromBrowser)
+	} else if strings.TrimSpace(opts.CookiesFile) != "" {
+		args = append(args, "--cookies", strings.TrimSpace(opts.CookiesFile))
+	}
+	if strings.TrimSpace(opts.ProxyURL) != "" {
+		args = append(args, "--proxy", strings.TrimSpace(opts.ProxyURL))
+	}
+	return args
+}
 
 func runMetadataCommand(ctx context.Context, binPath string, args []string, onLog func(string)) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, binPath, args...)
@@ -904,6 +1004,7 @@ func runMetadataCommand(ctx context.Context, binPath string, args []string, onLo
 	go func() {
 		defer close(stderrDone)
 		scanner := bufio.NewScanner(stderrPipe)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" {
@@ -919,6 +1020,9 @@ func runMetadataCommand(ctx context.Context, binPath string, args []string, onLo
 				onLog(line)
 			}
 		}
+		if sErr := scanner.Err(); sErr != nil && onLog != nil {
+			onLog(fmt.Sprintf("[stderr-scan-error] %v", sErr))
+		}
 	}()
 
 	<-stderrDone
@@ -926,7 +1030,7 @@ func runMetadataCommand(ctx context.Context, binPath string, args []string, onLo
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		errMsg := stringsTrim(stderrBuf.String())
+		errMsg := ExtractLastError(stderrBuf.String())
 		if errMsg == "" {
 			errMsg = err.Error()
 		}
@@ -938,11 +1042,16 @@ func runMetadataCommand(ctx context.Context, binPath string, args []string, onLo
 
 // FetchMetadata queries yt-dlp for video metadata and stream formats.
 func FetchMetadata(ctx context.Context, binPath string, videoURL string) (*VideoMetadata, error) {
-	return FetchMetadataWithLogs(ctx, binPath, videoURL, nil)
+	return FetchMetadataWithOptions(ctx, binPath, videoURL, MetadataOptions{}, nil)
 }
 
 // FetchMetadataWithLogs queries yt-dlp for video metadata while streaming stderr CLI logs.
 func FetchMetadataWithLogs(ctx context.Context, binPath string, videoURL string, onLog func(string)) (*VideoMetadata, error) {
+	return FetchMetadataWithOptions(ctx, binPath, videoURL, MetadataOptions{}, onLog)
+}
+
+// FetchMetadataWithOptions queries yt-dlp for video metadata with optional auth/proxy settings.
+func FetchMetadataWithOptions(ctx context.Context, binPath string, videoURL string, opts MetadataOptions, onLog func(string)) (*VideoMetadata, error) {
 	sanitizedURL, err := ParseURL(videoURL)
 	if err != nil {
 		return nil, err
@@ -951,7 +1060,9 @@ func FetchMetadataWithLogs(ctx context.Context, binPath string, videoURL string,
 		return nil, ErrMissingBinary
 	}
 
-	raw, err := runMetadataCommand(ctx, binPath, []string{"--dump-single-json", "--no-playlist", sanitizedURL}, onLog)
+	args := appendMetadataOptions([]string{"--dump-single-json", "--no-playlist"}, opts)
+	args = append(args, "--", sanitizedURL)
+	raw, err := runMetadataCommand(ctx, binPath, args, onLog)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, err
@@ -976,28 +1087,36 @@ func FetchMetadataWithLogs(ctx context.Context, binPath string, videoURL string,
 	return &meta, nil
 }
 
-// FetchThumbnail downloads raw image bytes for a video preview thumbnail.
-func FetchThumbnail(ctx context.Context, thumbnailURL string) ([]byte, error) {
-	if thumbnailURL == "" {
-		return nil, errors.New("empty thumbnail url")
+func shortVideoCodec(vcodec string) string {
+	l := strings.ToLower(vcodec)
+	switch {
+	case strings.HasPrefix(l, "avc1"), strings.Contains(l, "h264"):
+		return "H.264"
+	case strings.HasPrefix(l, "vp09"), strings.HasPrefix(l, "vp9"):
+		return "VP9"
+	case strings.HasPrefix(l, "av01"), strings.Contains(l, "av1"):
+		return "AV1"
+	case strings.HasPrefix(l, "hev1"), strings.HasPrefix(l, "hvc1"), strings.Contains(l, "h265"):
+		return "HEVC"
+	default:
+		return ""
 	}
+}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, thumbnailURL, nil)
-	if err != nil {
-		return nil, err
+func shortAudioCodec(acodec string) string {
+	l := strings.ToLower(acodec)
+	switch {
+	case strings.Contains(l, "opus"):
+		return "Opus"
+	case strings.HasPrefix(l, "mp4a"), strings.Contains(l, "aac"):
+		return "AAC"
+	case strings.Contains(l, "vorbis"):
+		return "Vorbis"
+	case strings.Contains(l, "flac"):
+		return "FLAC"
+	default:
+		return ""
 	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("thumbnail server returned HTTP %d", resp.StatusCode)
-	}
-
-	return io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
 }
 
 // ExtractVideoOptions extracts sorted video stream options from metadata formats.
@@ -1038,7 +1157,12 @@ func ExtractVideoOptions(formats []StreamFormat) []FormatOption {
 		if size > 0 {
 			sizeStr = fmt.Sprintf(" · %.1f MB", float64(size)/1024/1024)
 		}
-		label := fmt.Sprintf("%dp%s (%s)%s", f.Height, fpsStr, f.Ext, sizeStr)
+		codec := shortVideoCodec(f.VCodec)
+		codecStr := ""
+		if codec != "" {
+			codecStr = " · " + codec
+		}
+		label := fmt.Sprintf("%dp%s (%s%s)%s", f.Height, fpsStr, f.Ext, codecStr, sizeStr)
 		if !seen[label] {
 			seen[label] = true
 			options = append(options, FormatOption{Label: label, Value: f.FormatID})
@@ -1084,7 +1208,12 @@ func ExtractAudioOptions(formats []StreamFormat) []FormatOption {
 		if size > 0 {
 			sizeStr = fmt.Sprintf(" · %.1f MB", float64(size)/1024/1024)
 		}
-		label := fmt.Sprintf("%s(%s)%s", abrStr, f.Ext, sizeStr)
+		codec := shortAudioCodec(f.ACodec)
+		codecStr := ""
+		if codec != "" {
+			codecStr = " · " + codec
+		}
+		label := fmt.Sprintf("%s(%s%s)%s", abrStr, f.Ext, codecStr, sizeStr)
 		if !seen[label] {
 			seen[label] = true
 			options = append(options, FormatOption{Label: label, Value: f.FormatID})
@@ -1155,11 +1284,16 @@ func ParsePlaylistMetadataJSON(raw []byte) (*PlaylistMetadata, error) {
 
 // FetchPlaylistMetadata queries yt-dlp for flat playlist entries.
 func FetchPlaylistMetadata(ctx context.Context, binPath, playlistURL string) (*PlaylistMetadata, error) {
-	return FetchPlaylistMetadataWithLogs(ctx, binPath, playlistURL, nil)
+	return FetchPlaylistMetadataWithOptions(ctx, binPath, playlistURL, MetadataOptions{}, nil)
 }
 
 // FetchPlaylistMetadataWithLogs queries yt-dlp for flat playlist entries while streaming stderr CLI logs.
 func FetchPlaylistMetadataWithLogs(ctx context.Context, binPath, playlistURL string, onLog func(string)) (*PlaylistMetadata, error) {
+	return FetchPlaylistMetadataWithOptions(ctx, binPath, playlistURL, MetadataOptions{}, onLog)
+}
+
+// FetchPlaylistMetadataWithOptions queries yt-dlp for flat playlist entries with optional auth/proxy settings.
+func FetchPlaylistMetadataWithOptions(ctx context.Context, binPath, playlistURL string, opts MetadataOptions, onLog func(string)) (*PlaylistMetadata, error) {
 	sanitizedURL, err := ParseURL(playlistURL)
 	if err != nil {
 		return nil, err
@@ -1168,7 +1302,9 @@ func FetchPlaylistMetadataWithLogs(ctx context.Context, binPath, playlistURL str
 		return nil, ErrMissingBinary
 	}
 
-	raw, err := runMetadataCommand(ctx, binPath, []string{"--flat-playlist", "--dump-single-json", sanitizedURL}, onLog)
+	args := appendMetadataOptions([]string{"--flat-playlist", "--dump-single-json"}, opts)
+	args = append(args, "--", sanitizedURL)
+	raw, err := runMetadataCommand(ctx, binPath, args, onLog)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, err
@@ -1193,69 +1329,11 @@ func UpdateBinary(ctx context.Context, binPath string) (string, error) {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
-		msg := stringsTrim(errBuf.String())
+		msg := ExtractLastError(errBuf.String())
 		if msg == "" {
 			msg = err.Error()
 		}
 		return "", fmt.Errorf("yt-dlp update failed: %s", msg)
 	}
 	return stringsTrim(outBuf.String()), nil
-}
-
-// DefaultContainerOptions returns common audio/video container options.
-func DefaultContainerOptions() []FormatOption {
-	return []FormatOption{
-		{Label: "mp4", Value: "mp4"},
-		{Label: "mkv", Value: "mkv"},
-		{Label: "webm", Value: "webm"},
-		{Label: "mp3", Value: "mp3"},
-		{Label: "m4a", Value: "m4a"},
-		{Label: "opus", Value: "opus"},
-		{Label: "flac", Value: "flac"},
-		{Label: "wav", Value: "wav"},
-	}
-}
-
-// DefaultAudioQualityOptions returns standard yt-dlp --audio-quality presets.
-func DefaultAudioQualityOptions() []FormatOption {
-	return []FormatOption{
-		{Label: "Best (VBR 0)", Value: "0"},
-		{Label: "320 kbps", Value: "320K"},
-		{Label: "192 kbps", Value: "192K"},
-		{Label: "128 kbps", Value: "128K"},
-	}
-}
-
-// DefaultSponsorBlockCategories returns supported SponsorBlock segment categories.
-func DefaultSponsorBlockCategories() []string {
-	return []string{"sponsor", "intro", "outro", "selfpromo", "interaction"}
-}
-
-// FilenameTemplatePresets returns quick-insert filename templates.
-func FilenameTemplatePresets() []FormatOption {
-	return []FormatOption{
-		{Label: "Title", Value: "%(title)s"},
-		{Label: "Uploader - Title", Value: "%(uploader)s - %(title)s"},
-		{Label: "Playlist # - Title", Value: "%(playlist_index)s - %(title)s"},
-		{Label: "Date - Title", Value: "%(upload_date)s - %(title)s"},
-	}
-}
-
-// DefaultVideoOptions returns standard fallback video resolution options.
-func DefaultVideoOptions() []FormatOption {
-	return []FormatOption{
-		{Label: "Auto (Best Video)", Value: "bestvideo"},
-		{Label: "1080p (Full HD)", Value: "bestvideo[height<=1080]"},
-		{Label: "720p (HD)", Value: "bestvideo[height<=720]"},
-		{Label: "480p (SD)", Value: "bestvideo[height<=480]"},
-		{Label: "Audio Only (No Video)", Value: "none"},
-	}
-}
-
-// DefaultAudioOptions returns standard fallback audio stream options.
-func DefaultAudioOptions() []FormatOption {
-	return []FormatOption{
-		{Label: "Auto (Best Audio)", Value: "bestaudio"},
-		{Label: "None (Muted)", Value: "none"},
-	}
 }

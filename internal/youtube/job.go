@@ -18,34 +18,8 @@ import (
 
 // DownloadJob runs yt-dlp as a subprocess to download media.
 type DownloadJob struct {
-	URL                 string
-	BinaryPath          string
-	FFmpegPath          string
-	OutputDir           string
-	Quality             string
-	VideoStream         string
-	AudioStream         string
-	OutputFormat        string
-	AudioQuality        string
-	EmbedSubs           bool
-	SubLangs            string
-	WriteAutoSubs       bool
-	EmbedThumbnail      bool
-	EmbedChapters       bool
-	EmbedMetadata       bool
-	SponsorBlockMode    string
-	SponsorBlockCats    []string
-	TimeRangeStart      string
-	TimeRangeEnd        string
-	ForceKeyframesCuts  bool
-	CookiesFromBrowser  string
-	CookiesFile         string
-	ProxyURL            string
-	RateLimit           string
-	ConcurrentFragments int
-	CustomFilename      string
-	IsPlaylistItem      bool
-	CustomArgs          []string
+	CommandOptions
+	CustomArgs []string
 }
 
 // Run executes yt-dlp and streams progress lines.
@@ -77,34 +51,9 @@ func (j DownloadJob) Run(ctx context.Context, progress func(pluginapi.Progress))
 		return pluginapi.RunResult{}, fmt.Errorf("failed to create destination directory: %w", err)
 	}
 
-	cmdOpts := CommandOptions{
-		BinaryPath:          j.BinaryPath,
-		FFmpegPath:          j.FFmpegPath,
-		URL:                 sanitizedURL,
-		OutputDir:           outDir,
-		VideoStream:         j.VideoStream,
-		AudioStream:         j.AudioStream,
-		OutputFormat:        j.OutputFormat,
-		AudioQuality:        j.AudioQuality,
-		EmbedSubs:           j.EmbedSubs,
-		SubLangs:            j.SubLangs,
-		WriteAutoSubs:       j.WriteAutoSubs,
-		EmbedThumbnail:      j.EmbedThumbnail,
-		EmbedChapters:       j.EmbedChapters,
-		EmbedMetadata:       j.EmbedMetadata,
-		SponsorBlockMode:    j.SponsorBlockMode,
-		SponsorBlockCats:    j.SponsorBlockCats,
-		TimeRangeStart:      j.TimeRangeStart,
-		TimeRangeEnd:        j.TimeRangeEnd,
-		ForceKeyframesCuts:  j.ForceKeyframesCuts,
-		CookiesFromBrowser:  j.CookiesFromBrowser,
-		CookiesFile:         j.CookiesFile,
-		ProxyURL:            j.ProxyURL,
-		RateLimit:           j.RateLimit,
-		ConcurrentFragments: j.ConcurrentFragments,
-		CustomFilename:      j.CustomFilename,
-		IsPlaylistItem:      j.IsPlaylistItem,
-	}
+	cmdOpts := j.CommandOptions
+	cmdOpts.URL = sanitizedURL
+	cmdOpts.OutputDir = outDir
 
 	args := j.CustomArgs
 	var cmdPreview string
@@ -147,10 +96,11 @@ func (j DownloadJob) Run(ctx context.Context, progress func(pluginapi.Progress))
 	}
 
 	var mu sync.Mutex
-	lastUpdate := time.Now()
+	var lastUpdate time.Time
 	var lastPct float64
 	var lastMsg = "Starting yt-dlp..."
 	var finalOutputFile string
+	var jobDestinations []string
 	var stderrBuf bytes.Buffer
 
 	emitLine := func(line string, isStderr bool) {
@@ -159,9 +109,9 @@ func (j DownloadJob) Run(ctx context.Context, progress func(pluginapi.Progress))
 			return
 		}
 
-		mu.Lock()
-		defer mu.Unlock()
+		var toEmit *pluginapi.Progress
 
+		mu.Lock()
 		if isStderr && stderrBuf.Len() < maxStderrCapture {
 			if stderrBuf.Len() > 0 {
 				stderrBuf.WriteByte('\n')
@@ -171,6 +121,7 @@ func (j DownloadJob) Run(ctx context.Context, progress func(pluginapi.Progress))
 
 		if out, ok := parseOutputLine(trimmed); ok {
 			finalOutputFile = out
+			jobDestinations = append(jobDestinations, out)
 		}
 
 		if p, ok := ParseProgressLine(line); ok {
@@ -179,26 +130,29 @@ func (j DownloadJob) Run(ctx context.Context, progress func(pluginapi.Progress))
 				lastMsg = p.Message
 			}
 			p.LogLine = line
-			// Throttle progress updates to at most once per 60ms
-			if progress != nil && (time.Since(lastUpdate) >= 60*time.Millisecond || p.Done >= 100) {
+			// Throttle progress updates to at most once per 60ms (first update emits immediately).
+			if progress != nil && (lastUpdate.IsZero() || time.Since(lastUpdate) >= 60*time.Millisecond || p.Done >= 100) {
 				lastUpdate = time.Now()
-				progress(p)
+				toEmit = &p
 			}
-			return
+		} else {
+			if stageMsg, ok := classifyStageMessage(trimmed); ok {
+				lastMsg = stageMsg
+			}
+			if progress != nil {
+				toEmit = &pluginapi.Progress{
+					Done:    lastPct,
+					Total:   100,
+					Unit:    "%",
+					Message: lastMsg,
+					LogLine: trimmed,
+				}
+			}
 		}
+		mu.Unlock()
 
-		if stageMsg, ok := classifyStageMessage(trimmed); ok {
-			lastMsg = stageMsg
-		}
-
-		if progress != nil {
-			progress(pluginapi.Progress{
-				Done:    lastPct,
-				Total:   100,
-				Unit:    "%",
-				Message: lastMsg,
-				LogLine: trimmed,
-			})
+		if toEmit != nil {
+			progress(*toEmit)
 		}
 	}
 
@@ -206,30 +160,38 @@ func (j DownloadJob) Run(ctx context.Context, progress func(pluginapi.Progress))
 	go func() {
 		defer close(stderrDone)
 		errScanner := bufio.NewScanner(stderr)
+		errScanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for errScanner.Scan() {
 			if ctx.Err() != nil {
 				break
 			}
 			emitLine(errScanner.Text(), true)
 		}
+		if sErr := errScanner.Err(); sErr != nil && ctx.Err() == nil {
+			emitLine(fmt.Sprintf("[stderr-scan-error] %v", sErr), true)
+		}
 	}()
 
 	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		if ctx.Err() != nil {
 			break
 		}
 		emitLine(scanner.Text(), false)
 	}
+	if sErr := scanner.Err(); sErr != nil && ctx.Err() == nil {
+		emitLine(fmt.Sprintf("[stdout-scan-error] %v", sErr), true)
+	}
 
 	<-stderrDone
 	waitErr := cmd.Wait()
 	if waitErr != nil {
 		if ctx.Err() != nil || errors.Is(waitErr, context.Canceled) {
-			cleanPartialFiles(outDir)
+			cleanJobPartialFiles(outDir, jobDestinations)
 			return pluginapi.RunResult{}, context.Canceled
 		}
-		errMsg := stringsTrim(stderrBuf.String())
+		errMsg := ExtractLastError(stderrBuf.String())
 		if errMsg == "" {
 			errMsg = waitErr.Error()
 		}
@@ -277,6 +239,16 @@ func parseOutputLine(trimmed string) (string, bool) {
 	}
 	if s, ok := strings.CutPrefix(trimmed, "[ExtractAudio] Destination: "); ok {
 		return strings.Trim(s, `"'`), true
+	}
+	if s, ok := strings.CutPrefix(trimmed, "[VideoRemuxer] Remuxing video from "); ok {
+		if idx := strings.LastIndex(s, " to "); idx >= 0 {
+			return strings.Trim(s[idx+4:], `"'`), true
+		}
+	}
+	if s, ok := strings.CutPrefix(trimmed, "[MoveFiles] Moving file "); ok {
+		if idx := strings.LastIndex(s, " to "); idx >= 0 {
+			return strings.Trim(s[idx+4:], `"'`), true
+		}
 	}
 	if s, ok := strings.CutPrefix(trimmed, "[download] "); ok {
 		if existing, already := strings.CutSuffix(s, " has already been downloaded"); already {
@@ -339,7 +311,7 @@ func resolveFinalOutputPath(absDir, finalOutputFile, outputFormat string) string
 		}
 	}
 
-	for _, ext := range []string{"mp4", "mkv", "webm", "m4a", "mp3", "opus", "wav"} {
+	for _, ext := range []string{"mp4", "mkv", "webm", "m4a", "mp3", "opus", "flac", "wav"} {
 		testPath := filepath.Join(dir, cleanedBase+"."+ext)
 		if fi, err := os.Stat(testPath); err == nil && !fi.IsDir() {
 			return testPath
@@ -349,18 +321,38 @@ func resolveFinalOutputPath(absDir, finalOutputFile, outputFormat string) string
 	return candidate
 }
 
-func cleanPartialFiles(dir string) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
+// cleanJobPartialFiles removes only .part, .ytdl, and .part-Frag* files belonging
+// to destinations tracked by this specific job, never touching unrelated files in outDir.
+func cleanJobPartialFiles(outDir string, destinations []string) {
+	if len(destinations) == 0 {
 		return
 	}
-	for _, e := range entries {
-		if e.IsDir() {
+	absDir, err := filepath.Abs(outDir)
+	if err != nil {
+		absDir = outDir
+	}
+	seen := make(map[string]struct{}, len(destinations))
+	for _, dest := range destinations {
+		if dest == "" {
 			continue
 		}
-		name := e.Name()
-		if strings.HasSuffix(name, ".part") || strings.HasSuffix(name, ".ytdl") {
-			_ = os.Remove(filepath.Join(dir, name))
+		var basePath string
+		if filepath.IsAbs(dest) {
+			basePath = dest
+		} else {
+			basePath = filepath.Join(absDir, filepath.Base(dest))
+		}
+		if _, ok := seen[basePath]; ok {
+			continue
+		}
+		seen[basePath] = struct{}{}
+
+		_ = os.Remove(basePath + ".part")
+		_ = os.Remove(basePath + ".ytdl")
+		if frags, err := filepath.Glob(basePath + ".part-Frag*"); err == nil {
+			for _, f := range frags {
+				_ = os.Remove(f)
+			}
 		}
 	}
 }

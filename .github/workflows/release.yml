@@ -68,7 +68,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           mkdir -p dist/bin dist/bundles
-          go build -trimpath -o dist/bin/tool .
+          go build -trimpath -ldflags="-s -w" -o dist/bin/tool .
 
       - name: Install mtools-plugin CLI
         run: go install github.com/seiortech/mtools-sdk/cmd/mtools-plugin@v0.1.2
